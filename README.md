@@ -24,8 +24,8 @@ Designed as a complete aerodynamic "data factory," the project features a custom
 
 ### 1. Compile the Solver(s)
 You can compile the standard CPU solver or the GPU-accelerated version depending on your hardware.
+
 ```bash
-# Compile standard CPU solver
 g++ -O3 -std=c++17 solver.cpp -o solver
 ```
 
