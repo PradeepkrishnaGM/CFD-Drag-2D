@@ -17,19 +17,19 @@ This repository contains a high-performance, "from scratch" 2D Computational Flu
 
 ## Quick Start
 ### 1. Compile the Solver
-\`\`\`bash
+```bash
 g++ -O3 main.cpp -o cfd_solver
-\`\`\`
+```
 
 ### 2. Run a Single Simulation
-\`\`\`bash
+```bash
 ./cfd_solver --shape rectangle --width 10 --height 20 --angle 45 --velocity 0.05
-\`\`\`
+```
 
 ### 3. Generate a Dataset
-\`\`\`bash
+```bash
 python generate_dataset.py --samples 1000 --output_dir ./data/
-\`\`\`
+```
 
 ## Output Format
 The pipeline outputs a `results.csv` containing the aerodynamic metrics and a folder of corresponding `.png` velocity fields representing the wind tunnel states.
