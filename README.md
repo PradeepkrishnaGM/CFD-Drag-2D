@@ -14,8 +14,18 @@ Designed as a complete aerodynamic "data factory," the project features a custom
 * **Native Physics Calculation:** Accurately calculates the Drag Coefficient ($C_d$) via the Momentum Exchange Method directly inside the C++ simulation loop.
 * **Batch Automation:** Features a robust Python wrapper (`auto.py`) to procedurally generate balanced datasets of thousands of `(Image, Metric)` samples with built-in numerical stability checks.
 
+## Solver
+* D2Q9 lattice Boltzmann with TRT collision, half-way bounce-back walls, Zou-He velocity inlet
+  (uniform or parabolic) and pressure outlet. The inlet ramps up smoothly from rest.
+* Inputs: shape, sizes, angle and **Reynolds number** `Re = U·D/ν`, where `D` is the projected
+  frontal height of the rotated obstacle and `U` the mean inlet velocity (0.05 lattice units).
+* Outputs (`results.csv` in `--out-dir`): time-averaged **Cd**, **Cl**, lift fluctuation `Cl_rms`,
+  pressure loss, a steady/periodic flag, and optionally the mask and flow fields as `.npy`.
+* Validated in `tests/`: determinism, mass conservation, channel (Poiseuille) flow, and the
+  Schäfer–Turek 2D-1 cylinder benchmark (Cd = 5.58 at Re = 20).
+
 ## Status
-Work in progress. Planned next: solver validation against benchmarks, a CUDA solver,
+Work in progress. Planned next: a CUDA solver,
 large-scale dataset generation, and a CNN surrogate that predicts drag from geometry.
 See `SPEC.md` for the full plan and `DECISIONS.md` for design choices.
 

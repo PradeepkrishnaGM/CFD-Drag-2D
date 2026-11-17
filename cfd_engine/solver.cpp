@@ -1,356 +1,416 @@
 /**
- * Standalone 2D Lattice Boltzmann Method (LBM) Solver
+ * 2D Lattice Boltzmann solver (D2Q9, TRT collision) for flow past an obstacle in a channel.
  * Build with: make solver  (from the repo root; output: build/solver)
+ *
+ * Conventions (lattice units, dx = dt = 1, reference density 1):
+ *  - Rows y = 0 and y = ny-1 are wall nodes. With half-way bounce-back the effective
+ *    walls sit at y = 0.5 and y = ny - 1.5, so the fluid channel width is H = ny - 2.
+ *  - U is the MEAN inlet velocity (uniform or parabolic profile).
+ *  - D is the projected frontal height of the rotated obstacle (H for --shape none).
+ *  - Re = U * D / nu, nu = (tau - 0.5) / 3, so tau is derived from Re.
+ *  - Cd = 2 <Fx> / (U^2 D), Cl = 2 <Fy> / (U^2 D), averaged over the averaging window.
+ *
+ * Defaults mirror cfd_drag/params.py, which is authoritative; the Python scripts always
+ * pass values explicitly.
+ *
+ * Exit codes: 0 ok, 2 invalid configuration (rejected before running), 3 diverged.
  */
 
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <fstream>
-#include <string>
-#include <sstream>
-#include <iomanip>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-// D2Q9 Lattice Constants
+// D2Q9 lattice constants
 const int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
 const int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
-const double w[9] = {
-    4.0 / 9.0, 
-    1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0
-};
-// Opposite directions for bounce-back
+const double w[9] = {4.0 / 9.0,  1.0 / 9.0,  1.0 / 9.0,  1.0 / 9.0, 1.0 / 9.0,
+                     1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0};
 const int opp[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+
+enum Cell : uint8_t { FLUID = 0, OBSTACLE = 1, WALL = 2 };
+const double TRT_LAMBDA = 3.0 / 16.0;  // TRT magic parameter (3/16: exact half-way walls)
+const double HALF_CELL = 0.5;  // solid-node inset from the nominal boundary
 
 struct Config {
     int nx = 400;
     int ny = 100;
-    std::string shape = "circle";
-    double size1 = 10.0; // radius, width, or base
-    double size2 = 10.0; // height
-    double angle = 0.0;
-    double velocity = 0.1;
-    int steps = 10000;
-    
-    // Internal placements
-    double cx, cy;
+    std::string shape = "circle";  // circle | rect | tri | none
+    double size1 = 10.0;           // circle: radius; rect: width (x); tri: base (y)
+    double size2 = 10.0;           // rect: height (y); tri: length (x)
+    double angle = 0.0;            // rotation [deg], counter-clockwise
+    double re = 100.0;
+    double u = 0.05;               // mean inlet velocity
+    std::string inlet = "uniform"; // uniform | parabolic
+    double cx = -1.0, cy = -1.0;   // obstacle centre; default (nx/4, ny/2)
+    int warmup = -1;               // steps before averaging; default 2 flow-throughs
+    int avg = -1;                  // averaging steps; default 1 flow-through
+    int ramp = -1;                 // inlet ramp-up steps; default warmup / 4
+    double min_tau = 0.52;         // stability guard
+    double max_blockage = 0.25;    // D / H guard
+    bool box = false;              // closed box (all walls), for conservation tests
+    bool dump = false;             // write mask.npy and fields.npy
+    std::string out_dir = ".";
 };
 
+static double frontal_height(const Config& c) {
+    if (c.shape == "none") return c.ny - 2.0;
+    if (c.shape == "circle") return 2.0 * c.size1;
+    std::vector<std::pair<double, double>> v;  // local vertices (lx, ly)
+    if (c.shape == "rect") {
+        v = {{-c.size1 / 2, -c.size2 / 2}, {c.size1 / 2, -c.size2 / 2},
+             {c.size1 / 2, c.size2 / 2}, {-c.size1 / 2, c.size2 / 2}};
+    } else {  // tri
+        v = {{c.size2 / 2, 0.0}, {-c.size2 / 2, c.size1 / 2}, {-c.size2 / 2, -c.size1 / 2}};
+    }
+    double t = c.angle * M_PI / 180.0, lo = 1e300, hi = -1e300;
+    for (auto& p : v) {
+        double y = p.first * std::sin(t) + p.second * std::cos(t);
+        lo = std::min(lo, y);
+        hi = std::max(hi, y);
+    }
+    return hi - lo;
+}
+
+template <typename T>
+static void write_npy(const std::string& path, const std::vector<T>& data,
+                      const std::vector<size_t>& shape, const std::string& descr) {
+    std::ostringstream h;
+    h << "{'descr': '" << descr << "', 'fortran_order': False, 'shape': (";
+    for (size_t i = 0; i < shape.size(); ++i) h << shape[i] << (shape.size() == 1 || i + 1 < shape.size() ? ", " : "");
+    h << "), }";
+    std::string header = h.str();
+    size_t total = 10 + header.size() + 1;
+    header.append((64 - total % 64) % 64, ' ');
+    header.push_back('\n');
+    std::ofstream out(path, std::ios::binary);
+    out.write("\x93NUMPY\x01\x00", 8);
+    uint16_t len = static_cast<uint16_t>(header.size());
+    out.put(static_cast<char>(len & 0xff));
+    out.put(static_cast<char>(len >> 8));
+    out << header;
+    out.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(T));
+}
+
 class LBMSolver {
-private:
+   public:
     Config cfg;
-    double tau = 0.6; // Relaxation time (determines kinematic viscosity)
-
-    std::vector<double> f;
-    std::vector<double> f_post;
-    std::vector<double> rho;
-    std::vector<double> ux;
-    std::vector<double> uy;
-    std::vector<double> prev_u;
-    
-    std::vector<bool> is_solid;    // True for any wall/obstacle
-    std::vector<bool> is_obstacle; // True ONLY for the obstacle (for drag calc)
-
-    double Fx_drag = 0.0;
-    double Fy_lift = 0.0;
+    double D = 0.0, tau = 0.0, nu = 0.0;
+    std::vector<double> f, f_post, rho, ux, uy, u_in;
+    std::vector<uint8_t> cell;
+    double Fx = 0.0, Fy = 0.0;
 
     inline int idx(int x, int y) const { return y * cfg.nx + x; }
     inline int f_idx(int x, int y, int i) const { return (y * cfg.nx + x) * 9 + i; }
 
-    double equilibrium(int i, double r, double u_x, double u_y) const {
+    static double equilibrium(int i, double r, double u_x, double u_y) {
         double cu = cx[i] * u_x + cy[i] * u_y;
         double u2 = u_x * u_x + u_y * u_y;
         return w[i] * r * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * u2);
     }
 
-    bool checkObstacleGeometry(int x, int y) {
-        double dx = x - cfg.cx;
-        double dy = y - cfg.cy;
-
-        // Apply rotation matrix
-        double theta = cfg.angle * M_PI / 180.0;
-        double lx = dx * cos(theta) + dy * sin(theta);
-        double ly = -dx * sin(theta) + dy * cos(theta);
-
-        if (cfg.shape == "circle") {
-            return (lx * lx + ly * ly) <= (cfg.size1 * cfg.size1);
-        } 
-        else if (cfg.shape == "rect") {
-            return (std::abs(lx) <= cfg.size1 / 2.0) && (std::abs(ly) <= cfg.size2 / 2.0);
-        } 
-        else if (cfg.shape == "tri") {
-            // Isosceles triangle. Flat base faces left, tip faces right by default (0 deg).
-            // Vertices: tip=(size2/2, 0), bottom=(-size2/2, -size1/2), top=(-size2/2, size1/2)
-            double v1x = cfg.size2 / 2.0,  v1y = 0.0;
-            double v2x = -cfg.size2 / 2.0, v2y = cfg.size1 / 2.0;
-            double v3x = -cfg.size2 / 2.0, v3y = -cfg.size1 / 2.0;
-
-            // Barycentric coordinates for inside test
-            double denom = (v2y - v3y) * (v1x - v3x) + (v3x - v2x) * (v1y - v3y);
-            double w1 = ((v2y - v3y) * (lx - v3x) + (v3x - v2x) * (ly - v3y)) / denom;
-            double w2 = ((v3y - v1y) * (lx - v3x) + (v1x - v3x) * (ly - v3y)) / denom;
-            double w3 = 1.0 - w1 - w2;
-
-            return (w1 >= -1e-6 && w2 >= -1e-6 && w3 >= -1e-6);
+    bool inside_obstacle(int x, int y) const {
+        double dx = x - cfg.cx, dy = y - cfg.cy;
+        double t = cfg.angle * M_PI / 180.0;
+        double lx = dx * std::cos(t) + dy * std::sin(t);
+        double ly = -dx * std::sin(t) + dy * std::cos(t);
+        // Half-way bounce-back places the wall half a cell outside the last solid node,
+        // so a node is solid only if it lies at least HALF_CELL inside the shape boundary.
+        // This makes the effective obstacle match its nominal size (see DECISIONS.md).
+        const double h = HALF_CELL;
+        if (cfg.shape == "circle") return lx * lx + ly * ly <= (cfg.size1 - h) * (cfg.size1 - h);
+        if (cfg.shape == "rect") return std::abs(lx) <= cfg.size1 / 2 - h && std::abs(ly) <= cfg.size2 / 2 - h;
+        if (cfg.shape == "tri") {
+            // Isosceles triangle: flat base on the left, tip on the right at 0 deg.
+            // Vertices counter-clockwise, so the interior is left of every edge.
+            const double vx[3] = {cfg.size2 / 2, -cfg.size2 / 2, -cfg.size2 / 2};
+            const double vy[3] = {0.0, cfg.size1 / 2, -cfg.size1 / 2};
+            for (int e = 0; e < 3; ++e) {
+                double ex = vx[(e + 1) % 3] - vx[e], ey = vy[(e + 1) % 3] - vy[e];
+                double dist = (ex * (ly - vy[e]) - ey * (lx - vx[e])) / std::hypot(ex, ey);
+                if (dist < h) return false;
+            }
+            return true;
         }
         return false;
     }
 
-    void apply_zou_he_boundaries() {
-        // Left Inlet (Velocity boundary)
-        for (int y = 1; y < cfg.ny - 1; ++y) {
-            if (is_solid[idx(0, y)]) continue;
-            double r = f[f_idx(0,y,0)] + f[f_idx(0,y,2)] + f[f_idx(0,y,4)] +
-                       2.0 * (f[f_idx(0,y,3)] + f[f_idx(0,y,6)] + f[f_idx(0,y,7)]);
-            r /= (1.0 - cfg.velocity);
+    explicit LBMSolver(const Config& c) : cfg(c) {
+        D = frontal_height(cfg);
+        nu = cfg.u * D / cfg.re;
+        tau = 3.0 * nu + 0.5;
 
-            f[f_idx(0,y,1)] = f[f_idx(0,y,3)] + (2.0/3.0) * r * cfg.velocity;
-            f[f_idx(0,y,5)] = f[f_idx(0,y,7)] - 0.5 * (f[f_idx(0,y,2)] - f[f_idx(0,y,4)]) + (1.0/6.0) * r * cfg.velocity;
-            f[f_idx(0,y,8)] = f[f_idx(0,y,6)] + 0.5 * (f[f_idx(0,y,2)] - f[f_idx(0,y,4)]) + (1.0/6.0) * r * cfg.velocity;
-        }
-
-        // Right Outlet (Constant pressure / density boundary)
-        for (int y = 1; y < cfg.ny - 1; ++y) {
-            int x = cfg.nx - 1;
-            if (is_solid[idx(x, y)]) continue;
-            double r = 1.0;
-            double u = -1.0 + (f[f_idx(x,y,0)] + f[f_idx(x,y,2)] + f[f_idx(x,y,4)] +
-                               2.0 * (f[f_idx(x,y,1)] + f[f_idx(x,y,5)] + f[f_idx(x,y,8)])) / r;
-
-            f[f_idx(x,y,3)] = f[f_idx(x,y,1)] - (2.0/3.0) * r * u;
-            f[f_idx(x,y,6)] = f[f_idx(x,y,8)] - 0.5 * (f[f_idx(x,y,2)] - f[f_idx(x,y,4)]) - (1.0/6.0) * r * u;
-            f[f_idx(x,y,7)] = f[f_idx(x,y,5)] + 0.5 * (f[f_idx(x,y,2)] - f[f_idx(x,y,4)]) - (1.0/6.0) * r * u;
-        }
-    }
-
-public:
-    LBMSolver(const Config& configuration) : cfg(configuration) {
         int N = cfg.nx * cfg.ny;
-        f.resize(N * 9);
-        f_post.resize(N * 9);
-        rho.resize(N, 1.0);
-        ux.resize(N, cfg.velocity);
-        uy.resize(N, 0.0);
-        prev_u.resize(N, cfg.velocity);
-        is_solid.resize(N, false);
-        is_obstacle.resize(N, false);
+        f.assign(N * 9, 0.0);
+        f_post.assign(N * 9, 0.0);
+        rho.assign(N, 1.0);
+        ux.assign(N, 0.0);
+        uy.assign(N, 0.0);
+        cell.assign(N, FLUID);
 
-        cfg.cx = cfg.nx / 4.0;
-        cfg.cy = cfg.ny / 2.0;
+        // Inlet profile per row (mean velocity = u)
+        u_in.assign(cfg.ny, 0.0);
+        double H = cfg.ny - 2.0;
+        for (int y = 1; y < cfg.ny - 1; ++y) {
+            double s = (y - 0.5) / H;
+            u_in[y] = (cfg.inlet == "parabolic") ? 6.0 * cfg.u * s * (1.0 - s) : cfg.u;
+        }
 
-        // Initialize Geometry & Boundary Arrays
         for (int y = 0; y < cfg.ny; ++y) {
             for (int x = 0; x < cfg.nx; ++x) {
-                // Top and Bottom walls
-                if (y == 0 || y == cfg.ny - 1) {
-                    is_solid[idx(x, y)] = true;
-                }
-                // Central Obstacle
-                else if (checkObstacleGeometry(x, y)) {
-                    is_solid[idx(x, y)] = true;
-                    is_obstacle[idx(x, y)] = true;
-                    ux[idx(x, y)] = 0.0;
-                    uy[idx(x, y)] = 0.0;
-                }
-
-                // Initialize F with equilibrium
-                for (int i = 0; i < 9; ++i) {
-                    f[f_idx(x, y, i)] = equilibrium(i, rho[idx(x,y)], ux[idx(x,y)], uy[idx(x,y)]);
-                }
+                int k = idx(x, y);
+                bool wall = y == 0 || y == cfg.ny - 1 || (cfg.box && (x == 0 || x == cfg.nx - 1));
+                if (wall) cell[k] = WALL;
+                else if (inside_obstacle(x, y)) cell[k] = OBSTACLE;
+                else if (cfg.box) ux[k] = u_in[y];  // open channel starts at rest (inlet ramps up)
+                for (int i = 0; i < 9; ++i) f[f_idx(x, y, i)] = equilibrium(i, rho[k], ux[k], uy[k]);
             }
         }
     }
 
-    bool step(int current_step) {
-        // COLLISION & MACROSCOPIC VARS
+    double fluid_mass() const {
+        double m = 0.0;
+        for (int k = 0; k < cfg.nx * cfg.ny; ++k)
+            if (cell[k] == FLUID)
+                for (int i = 0; i < 9; ++i) m += f[k * 9 + i];
+        return m;
+    }
+
+    void apply_zou_he(double ramp) {
+        for (int y = 1; y < cfg.ny - 1; ++y) {  // velocity inlet, x = 0
+            if (cell[idx(0, y)] != FLUID) continue;
+            double u = ramp * u_in[y];
+            double r = (f[f_idx(0, y, 0)] + f[f_idx(0, y, 2)] + f[f_idx(0, y, 4)] +
+                        2.0 * (f[f_idx(0, y, 3)] + f[f_idx(0, y, 6)] + f[f_idx(0, y, 7)])) / (1.0 - u);
+            double d = 0.5 * (f[f_idx(0, y, 2)] - f[f_idx(0, y, 4)]);
+            f[f_idx(0, y, 1)] = f[f_idx(0, y, 3)] + (2.0 / 3.0) * r * u;
+            f[f_idx(0, y, 5)] = f[f_idx(0, y, 7)] - d + (1.0 / 6.0) * r * u;
+            f[f_idx(0, y, 8)] = f[f_idx(0, y, 6)] + d + (1.0 / 6.0) * r * u;
+        }
+        int x = cfg.nx - 1;
+        for (int y = 1; y < cfg.ny - 1; ++y) {  // pressure outlet (rho = 1), x = nx - 1
+            if (cell[idx(x, y)] != FLUID) continue;
+            double u = -1.0 + f[f_idx(x, y, 0)] + f[f_idx(x, y, 2)] + f[f_idx(x, y, 4)] +
+                       2.0 * (f[f_idx(x, y, 1)] + f[f_idx(x, y, 5)] + f[f_idx(x, y, 8)]);
+            double d = 0.5 * (f[f_idx(x, y, 2)] - f[f_idx(x, y, 4)]);
+            f[f_idx(x, y, 3)] = f[f_idx(x, y, 1)] - (2.0 / 3.0) * u;
+            f[f_idx(x, y, 6)] = f[f_idx(x, y, 8)] - d - (1.0 / 6.0) * u;
+            f[f_idx(x, y, 7)] = f[f_idx(x, y, 5)] + d - (1.0 / 6.0) * u;
+        }
+    }
+
+    // One LBM step. Sets Fx, Fy to the momentum-exchange force on the obstacle.
+    void step(int n) {
+        // TRT collision: symmetric part relaxes with tau (sets viscosity), antisymmetric
+        // part with tau_minus chosen so that (tau - 1/2)(tau_minus - 1/2) = TRT_LAMBDA.
+        const double om_p = 1.0 / tau;
+        const double om_m = 1.0 / (0.5 + TRT_LAMBDA / (tau - 0.5));
+        double feq[9];
         for (int y = 1; y < cfg.ny - 1; ++y) {
             for (int x = 0; x < cfg.nx; ++x) {
-                if (is_solid[idx(x, y)]) continue;
-
+                int k = idx(x, y);
+                if (cell[k] != FLUID) continue;
                 double r = 0, ru = 0, rv = 0;
                 for (int i = 0; i < 9; ++i) {
-                    double val = f[f_idx(x, y, i)];
-                    r += val;
-                    ru += cx[i] * val;
-                    rv += cy[i] * val;
+                    double v = f[k * 9 + i];
+                    r += v;
+                    ru += cx[i] * v;
+                    rv += cy[i] * v;
                 }
-                
-                double u_x = ru / r;
-                double u_y = rv / r;
-
-                rho[idx(x, y)] = r;
-                ux[idx(x, y)] = u_x;
-                uy[idx(x, y)] = u_y;
-
+                double u_x = ru / r, u_y = rv / r;
+                rho[k] = r;
+                ux[k] = u_x;
+                uy[k] = u_y;
+                for (int i = 0; i < 9; ++i) feq[i] = equilibrium(i, r, u_x, u_y);
                 for (int i = 0; i < 9; ++i) {
-                    double feq = equilibrium(i, r, u_x, u_y);
-                    f_post[f_idx(x, y, i)] = f[f_idx(x, y, i)] - (1.0 / tau) * (f[f_idx(x, y, i)] - feq);
+                    const int j = opp[i];
+                    const double fp = 0.5 * (f[k * 9 + i] + f[k * 9 + j]), fm = 0.5 * (f[k * 9 + i] - f[k * 9 + j]);
+                    const double ep = 0.5 * (feq[i] + feq[j]), em = 0.5 * (feq[i] - feq[j]);
+                    f_post[k * 9 + i] = f[k * 9 + i] - om_p * (fp - ep) - om_m * (fm - em);
                 }
             }
         }
 
-        // Convergence Check (every 100 steps)
-        bool converged = false;
-        if (current_step % 100 == 0) {
-            double error = 0.0;
-            double sum_u = 0.0;
-            for (int i = 0; i < cfg.nx * cfg.ny; ++i) {
-                if (!is_solid[i]) {
-                    double u_mag = std::sqrt(ux[i]*ux[i] + uy[i]*uy[i]);
-                    error += std::abs(u_mag - prev_u[i]);
-                    sum_u += u_mag;
-                    prev_u[i] = u_mag;
-                }
-            }
-            
-            // A heuristic of `nx * 5` ensures the flow crosses the domain 5 times.
-            int min_steps_for_convergence = cfg.nx * 5; 
-            if (current_step > min_steps_for_convergence && sum_u > 1e-9 && (error / sum_u) < 1e-5) {
-                converged = true;
-            }
-        }
-
-        // STREAMING & DRAG CALCULATION
-        Fx_drag = 0.0;
-        Fy_lift = 0.0;
-
-        for (int y = 0; y < cfg.ny; ++y) {
+        Fx = Fy = 0.0;
+        for (int y = 1; y < cfg.ny - 1; ++y) {
             for (int x = 0; x < cfg.nx; ++x) {
-                if (is_solid[idx(x, y)]) continue;
-
+                if (cell[idx(x, y)] != FLUID) continue;
                 for (int i = 0; i < 9; ++i) {
-                    int nx = x - cx[i];
-                    int ny = y - cy[i];
-
-                    if (nx < 0 || nx >= cfg.nx || ny < 0 || ny >= cfg.ny) {
+                    int sx = x - cx[i], sy = y - cy[i];
+                    if (sx < 0 || sx >= cfg.nx) {  // outside: overwritten by Zou-He
                         f[f_idx(x, y, i)] = f_post[f_idx(x, y, i)];
                         continue;
                     }
-
-                    if (is_solid[idx(nx, ny)]) {
-                        // Mid-way bounce back
-                        int opp_dir = opp[i];
-                        f[f_idx(x, y, i)] = f_post[f_idx(x, y, opp_dir)];
-                        
-                        // Momentum Exchange Method for forces on obstacle
-                        if (is_obstacle[idx(nx, ny)]) {
-                            Fx_drag += 2.0 * cx[opp_dir] * f_post[f_idx(x, y, opp_dir)];
-                            Fy_lift += 2.0 * cy[opp_dir] * f_post[f_idx(x, y, opp_dir)];
+                    uint8_t src = cell[idx(sx, sy)];
+                    if (src == FLUID) {
+                        f[f_idx(x, y, i)] = f_post[f_idx(sx, sy, i)];
+                    } else {  // half-way bounce-back
+                        double v = f_post[f_idx(x, y, opp[i])];
+                        f[f_idx(x, y, i)] = v;
+                        if (src == OBSTACLE) {
+                            Fx += 2.0 * cx[opp[i]] * v;
+                            Fy += 2.0 * cy[opp[i]] * v;
                         }
-                    } else {
-                        // Standard pull stream
-                        f[f_idx(x, y, i)] = f_post[f_idx(nx, ny, i)];
                     }
                 }
             }
         }
-
-        // APPLY BOUNDARIES
-        apply_zou_he_boundaries();
-
-        return converged;
+        if (!cfg.box) {  // smooth sin^2 ramp of the inlet velocity avoids a start-up shock
+            double r = n >= cfg.ramp ? 1.0 : std::pow(std::sin(0.5 * M_PI * n / cfg.ramp), 2);
+            apply_zou_he(r);
+        }
     }
 
-    void saveResultsAndImage() {
-        // --- Calculate final Aerodynamics metrics ---
-        double L = cfg.size2; 
-        if (cfg.shape == "circle") L = 2.0 * cfg.size1;
-
-        double Cd = (2.0 * Fx_drag) / (1.0 * cfg.velocity * cfg.velocity * L);
-
-        // Pressure Drop (average rho at inlet vs outlet)
-        double rho_in = 0, rho_out = 0;
-        int count_in = 0, count_out = 0;
+    double pressure_loss() const {
+        double in = 0, out = 0;
+        int n_in = 0, n_out = 0;
         for (int y = 1; y < cfg.ny - 1; ++y) {
-            if (!is_solid[idx(1, y)]) { rho_in += rho[idx(1, y)]; count_in++; }
-            if (!is_solid[idx(cfg.nx - 2, y)]) { rho_out += rho[idx(cfg.nx - 2, y)]; count_out++; }
+            if (cell[idx(1, y)] == FLUID) { in += rho[idx(1, y)]; ++n_in; }
+            if (cell[idx(cfg.nx - 2, y)] == FLUID) { out += rho[idx(cfg.nx - 2, y)]; ++n_out; }
         }
-        double dP = ((rho_in / count_in) - (rho_out / count_out)) / 3.0; // P = rho * cs^2
+        return (in / n_in - out / n_out) / 3.0;  // p = rho * cs^2
+    }
 
-        // --- Save to CSV ---
-        std::ifstream infile("results.csv");
-        bool write_header = !infile.good();
-        infile.close();
-
-        std::ofstream csv("results.csv", std::ios::app);
-        if (write_header) {
-            csv << "shape_type,size1,size2,angle,velocity,Cd,pressure_loss\n";
-        }
-        csv << cfg.shape << "," << cfg.size1 << "," << cfg.size2 << ","
-            << cfg.angle << "," << cfg.velocity << "," << Cd << "," << dP << "\n";
-        csv.close();
-
-        std::cout << "=> Final Cd: " << Cd << ", Pressure Loss: " << dP << std::endl;
-
-        // --- Save Flow Field PPM ---
-        std::ofstream ppm("flow_field.ppm", std::ios::binary);
+    void save_image(const std::string& path) const {
+        std::ofstream ppm(path, std::ios::binary);
         ppm << "P6\n" << cfg.nx << " " << cfg.ny << "\n255\n";
-        
-        for (int y = cfg.ny - 1; y >= 0; --y) { // Top to bottom for image formats
+        double umax = 1.5 * (cfg.inlet == "parabolic" ? 1.5 * cfg.u : cfg.u);
+        for (int y = cfg.ny - 1; y >= 0; --y) {
             for (int x = 0; x < cfg.nx; ++x) {
-                if (is_solid[idx(x, y)]) {
-                    ppm << (char)0 << (char)0 << (char)0;
-                    continue;
-                }
-
-                double u = std::sqrt(ux[idx(x, y)] * ux[idx(x, y)] + uy[idx(x, y)] * uy[idx(x, y)]);
-                double v = std::min(1.0, u / (1.5 * cfg.velocity)); // Map [0, 1.5 * U]
-
-                // Standard Jet Colormap
-                int r = std::max(0, std::min(255, (int)(255.0 * (1.5 - std::abs(4.0 * v - 3.0)))));
-                int g = std::max(0, std::min(255, (int)(255.0 * (1.5 - std::abs(4.0 * v - 2.0)))));
-                int b = std::max(0, std::min(255, (int)(255.0 * (1.5 - std::abs(4.0 * v - 1.0)))));
-                
-                ppm << (char)r << (char)g << (char)b;
+                int k = idx(x, y);
+                if (cell[k] != FLUID) { ppm << (char)0 << (char)0 << (char)0; continue; }
+                double v = std::min(1.0, std::sqrt(ux[k] * ux[k] + uy[k] * uy[k]) / umax);
+                auto ch = [&](double o) { return (char)std::clamp((int)(255.0 * (1.5 - std::abs(4.0 * v - o))), 0, 255); };
+                ppm << ch(3.0) << ch(2.0) << ch(1.0);  // jet colormap
             }
         }
-        ppm.close();
-        std::cout << "=> Saved 'results.csv' and 'flow_field.ppm'\n";
+    }
+
+    void dump(const std::string& dir) const {
+        size_t ny = cfg.ny, nx = cfg.nx;
+        write_npy(dir + "/mask.npy", cell, {ny, nx}, "|u1");
+        std::vector<double> fields;
+        fields.reserve(3 * nx * ny);
+        fields.insert(fields.end(), ux.begin(), ux.end());
+        fields.insert(fields.end(), uy.begin(), uy.end());
+        fields.insert(fields.end(), rho.begin(), rho.end());
+        write_npy(dir + "/fields.npy", fields, {3, ny, nx}, "<f8");
     }
 };
 
+static int fail(const std::string& msg) {
+    std::cerr << "Invalid configuration: " << msg << "\n";
+    return 2;
+}
+
 int main(int argc, char** argv) {
     Config cfg;
-
-    // Headless CLI parser
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--width" && i + 1 < argc) cfg.nx = std::stoi(argv[++i]);
-        else if (arg == "--height" && i + 1 < argc) cfg.ny = std::stoi(argv[++i]);
-        else if (arg == "--shape" && i + 1 < argc) cfg.shape = argv[++i];
-        else if (arg == "--size1" && i + 1 < argc) cfg.size1 = std::stod(argv[++i]);
-        else if (arg == "--size2" && i + 1 < argc) cfg.size2 = std::stod(argv[++i]);
-        else if (arg == "--angle" && i + 1 < argc) cfg.angle = std::stod(argv[++i]);
-        else if (arg == "--velocity" && i + 1 < argc) cfg.velocity = std::stod(argv[++i]);
-        else if (arg == "--steps" && i + 1 < argc) cfg.steps = std::stoi(argv[++i]);
+    int legacy_steps = -1;
+    try {
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            auto next = [&]() -> std::string {
+                if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
+                return argv[++i];
+            };
+            if (a == "--width") cfg.nx = std::stoi(next());
+            else if (a == "--height") cfg.ny = std::stoi(next());
+            else if (a == "--shape") cfg.shape = next();
+            else if (a == "--size1") cfg.size1 = std::stod(next());
+            else if (a == "--size2") cfg.size2 = std::stod(next());
+            else if (a == "--angle") cfg.angle = std::stod(next());
+            else if (a == "--re") cfg.re = std::stod(next());
+            else if (a == "--u" || a == "--velocity") cfg.u = std::stod(next());
+            else if (a == "--inlet") cfg.inlet = next();
+            else if (a == "--cx") cfg.cx = std::stod(next());
+            else if (a == "--cy") cfg.cy = std::stod(next());
+            else if (a == "--warmup") cfg.warmup = std::stoi(next());
+            else if (a == "--avg") cfg.avg = std::stoi(next());
+            else if (a == "--ramp") cfg.ramp = std::stoi(next());
+            else if (a == "--steps") legacy_steps = std::stoi(next());  // total; 2/3 warm-up
+            else if (a == "--min-tau") cfg.min_tau = std::stod(next());
+            else if (a == "--max-blockage") cfg.max_blockage = std::stod(next());
+            else if (a == "--out-dir") cfg.out_dir = next();
+            else if (a == "--box") cfg.box = true;
+            else if (a == "--dump") cfg.dump = true;
+            else throw std::runtime_error("unknown argument " + a);
+        }
+    } catch (const std::exception& e) {
+        return fail(e.what());
     }
 
-    std::cout << "Initializing 2D LBM Solver...\n";
-    std::cout << "Domain: " << cfg.nx << "x" << cfg.ny << ", Velocity: " << cfg.velocity << "\n";
-    std::cout << "Obstacle: " << cfg.shape << " (s1:" << cfg.size1 << ", s2:" << cfg.size2 
-              << ", angle:" << cfg.angle << " deg)\n";
+    if (cfg.shape != "circle" && cfg.shape != "rect" && cfg.shape != "tri" && cfg.shape != "none")
+        return fail("unknown shape " + cfg.shape);
+    if (cfg.inlet != "uniform" && cfg.inlet != "parabolic") return fail("unknown inlet " + cfg.inlet);
+    if (cfg.nx < 8 || cfg.ny < 5 || cfg.re <= 0 || cfg.u <= 0) return fail("non-positive size, Re or U");
+    if (cfg.cx < 0) cfg.cx = cfg.nx / 4.0;
+    if (cfg.cy < 0) cfg.cy = cfg.ny / 2.0;
+    double flow_through = cfg.nx / cfg.u;
+    if (legacy_steps > 0 && cfg.warmup < 0 && cfg.avg < 0) {
+        cfg.warmup = legacy_steps * 2 / 3;
+        cfg.avg = legacy_steps - cfg.warmup;
+    }
+    if (cfg.warmup < 0) cfg.warmup = (int)(2.0 * flow_through);
+    if (cfg.avg <= 0) cfg.avg = std::max(1, (int)flow_through);
+    if (cfg.ramp <= 0) cfg.ramp = std::max(1, cfg.warmup / 4);
 
-    LBMSolver solver(cfg);
+    LBMSolver s(cfg);
+    double H = cfg.ny - 2.0, blockage = s.D / H;
+    std::cout << "LBM D2Q9 | domain " << cfg.nx << "x" << cfg.ny << " | " << cfg.shape
+              << " | Re " << cfg.re << " | U " << cfg.u << " | D " << s.D << " | tau " << s.tau
+              << " | blockage " << blockage << "\n";
+    if (s.tau < cfg.min_tau) return fail("tau " + std::to_string(s.tau) + " < min_tau");
+    if (cfg.shape != "none" && blockage > cfg.max_blockage)
+        return fail("blockage " + std::to_string(blockage) + " > max_blockage");
 
-    int min_steps_for_convergence = cfg.nx * 5;
-    std::cout << "Minimum warm-up steps required: " << min_steps_for_convergence << "\n";
-
-    for (int step = 0; step < cfg.steps; ++step) {
-        bool converged = solver.step(step);
-        
+    const double mass0 = s.fluid_mass();
+    const int total = cfg.warmup + cfg.avg, half = cfg.warmup + cfg.avg / 2;
+    double sx = 0, sy = 0, syy = 0, sx1 = 0, sx2 = 0;
+    bool diverged = false;
+    for (int step = 0; step < total; ++step) {
+        s.step(step);
+        if (step >= cfg.warmup) {
+            sx += s.Fx;
+            sy += s.Fy;
+            syy += s.Fy * s.Fy;
+            (step < half ? sx1 : sx2) += s.Fx;
+        }
         if (step % 500 == 0) {
-            std::cout << "Step " << step << " / " << cfg.steps << "\r" << std::flush;
-        }
-
-        if (converged) {
-            std::cout << "\nSteady-state convergence reached at step " << step << "!" << std::endl;
-            break;
+            std::cout << "Step " << step << " / " << total << "\r" << std::flush;
+            if (!std::isfinite(s.fluid_mass())) { diverged = true; break; }
         }
     }
-    std::cout << "\nSimulation Complete. Calculating and exporting metrics..." << std::endl;
-    
-    solver.saveResultsAndImage();
+    std::cout << "\n";
+    if (!std::isfinite(s.fluid_mass())) diverged = true;
 
-    return 0;
+    const double q = 0.5 * cfg.u * cfg.u * s.D;  // dynamic pressure * reference length
+    const int n = cfg.avg, n1 = half - cfg.warmup, n2 = total - half;
+    double Fx_mean = sx / n, Fy_mean = sy / n;
+    double Cd = Fx_mean / q, Cl = Fy_mean / q;
+    double Cl_rms = std::sqrt(std::max(0.0, syy / n - Fy_mean * Fy_mean)) / q;
+    double cd_drift = (n1 > 0 && n2 > 0 && Fx_mean != 0.0)
+                          ? std::abs(sx2 / n2 - sx1 / n1) / std::abs(Fx_mean) : 0.0;
+    double mass_change = (s.fluid_mass() - mass0) / mass0;
+    std::string status = diverged ? "diverged" : (Cl_rms < 1e-4 ? "steady" : "periodic");
+
+    std::ofstream csv(cfg.out_dir + "/results.csv");
+    csv << std::setprecision(10)
+        << "shape_type,size1,size2,angle,re,u,tau,D,blockage,Cd,Cl,Cl_rms,cd_drift,"
+           "pressure_loss,mass_rel_change,steps,status\n"
+        << cfg.shape << "," << cfg.size1 << "," << cfg.size2 << "," << cfg.angle << "," << cfg.re
+        << "," << cfg.u << "," << s.tau << "," << s.D << "," << blockage << "," << Cd << "," << Cl
+        << "," << Cl_rms << "," << cd_drift << "," << s.pressure_loss() << "," << mass_change << ","
+        << total << "," << status << "\n";
+    csv.close();
+    s.save_image(cfg.out_dir + "/flow_field.ppm");
+    if (cfg.dump) s.dump(cfg.out_dir);
+
+    std::cout << "=> Cd " << Cd << " | Cl " << Cl << " | Cl_rms " << Cl_rms << " | status " << status << "\n";
+    return diverged ? 3 : 0;
 }

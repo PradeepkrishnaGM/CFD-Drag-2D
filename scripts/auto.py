@@ -11,7 +11,7 @@ from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cfd_drag.params import DOMAIN, SAMPLING  # noqa: E402
+from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING  # noqa: E402
 from cfd_drag.paths import DEFAULT_DATASET_DIR, SOLVER_EXE  # noqa: E402
 
 # ==========================================
@@ -37,7 +37,8 @@ def setup_directories():
             writer = csv.writer(f)
             writer.writerow([
                 "sample_id", "shape", "size1", "size2", 
-                "angle", "velocity", "Cd", "pressure_loss", "image_path"
+                "angle", "re", "D", "blockage", "Cd", "Cl", "Cl_rms", "cd_drift",
+                "pressure_loss", "status", "image_path"
             ])
 
 def cleanup_temp_files(run_dir):
@@ -64,14 +65,14 @@ def generate_random_params(allowed_shapes):
         size2 = random.uniform(min_size, max_size)
         
     angle = random.uniform(SAMPLING.angle_min, SAMPLING.angle_max)
-    velocity = random.uniform(SAMPLING.velocity_min, SAMPLING.velocity_max)
+    re = random.uniform(SAMPLING.re_min, SAMPLING.re_max)
     
     return {
         "shape": shape,
         "size1": round(size1, 3),
         "size2": round(size2, 3),
         "angle": round(angle, 2),
-        "velocity": round(velocity, 4)
+        "re": round(re, 2)
     }
 
 # ==========================================
@@ -123,8 +124,13 @@ def main():
                 "--size1", str(params["size1"]),
                 "--size2", str(params["size2"]),
                 "--angle", str(params["angle"]),
-                "--velocity", str(params["velocity"]),
-                "--steps", str(DOMAIN.steps)
+                "--re", str(params["re"]),
+                "--u", str(PHYSICS.u),
+                "--min-tau", str(PHYSICS.min_tau),
+                "--max-blockage", str(PHYSICS.max_blockage),
+                "--warmup", str(PHYSICS.warmup_steps(NX)),
+                "--avg", str(PHYSICS.avg_steps(NX)),
+                "--out-dir", str(run_dir)
             ]
             
             # 4. Run the C++ Solver
@@ -135,6 +141,7 @@ def main():
                 # Ignore this iteration and retry
                 continue
             except subprocess.CalledProcessError:
+                # Exit 2: rejected (tau/blockage guard); exit 3: diverged
                 # C++ solver crashed or returned non-zero
                 continue
                 
@@ -153,7 +160,7 @@ def main():
                 dP = float(row["pressure_loss"])
                 
                 # 6. NaN / Inf Check
-                if math.isnan(Cd) or math.isinf(Cd) or math.isnan(dP) or math.isinf(dP):
+                if row["status"] == "diverged" or not all(map(math.isfinite, (Cd, dP))):
                     continue # Discard unstable numerical results
                     
                 # Optional: Discard physically unrealistic blow-ups (e.g. Cd > 100)
@@ -185,9 +192,10 @@ def main():
                     params["size1"], 
                     params["size2"], 
                     params["angle"], 
-                    params["velocity"], 
-                    Cd, 
-                    dP, 
+                    params["re"],
+                    row["D"], row["blockage"],
+                    Cd, row["Cl"], row["Cl_rms"], row["cd_drift"],
+                    dP, row["status"], 
                     f"images/{image_filename}"  # relative to the dataset dir
                 ])
                 
