@@ -1,0 +1,33 @@
+{
+  "seed": 0,
+  "domain": {
+    "nx": 400,
+    "ny": 100,
+    "timeout_s": 300
+  },
+  "physics": {
+    "u": 0.05,
+    "min_tau": 0.52,
+    "max_blockage": 0.25,
+    "warmup_flowthroughs": 2.0,
+    "avg_flowthroughs": 1.0,
+    "steady_cl_rms": 0.02
+  },
+  "sampling": {
+    "shapes": [
+      "circle",
+      "rect",
+      "tri"
+    ],
+    "re_min": 20.0,
+    "re_max": 100.0,
+    "d_min": 5.0,
+    "aspect_max": 3.0,
+    "min_thickness": 3.0,
+    "angle_min": 0.0,
+    "angle_max": 180.0,
+    "crop": 64,
+    "crop_margin": 4.0,
+    "max_abs_cd": 100.0
+  }
+}

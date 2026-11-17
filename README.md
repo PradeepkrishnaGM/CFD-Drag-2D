@@ -12,7 +12,7 @@ Designed as a complete aerodynamic "data factory," the project features a custom
 * **Interactive GUI Studio:** A responsive, dark-themed PyQt6 desktop application to manually design obstacles, tune physics parameters, and visualize flow fields instantly.
 * **Custom Geometry Handling:** Simulates fluid interaction around circles, rectangles, and triangles with dynamic sizes and variable Angles of Attack (AoA).
 * **Native Physics Calculation:** Accurately calculates the Drag Coefficient ($C_d$) via the Momentum Exchange Method directly inside the C++ simulation loop.
-* **Batch Automation:** Features a robust Python wrapper (`auto.py`) to procedurally generate balanced datasets of thousands of `(Image, Metric)` samples with built-in numerical stability checks.
+* **Batch Automation:** `scripts/generate.py` samples valid cases from a seed, runs them in parallel, resumes interrupted runs, and stores obstacle masks with their aerodynamic targets.
 
 ## Solver
 * D2Q9 lattice Boltzmann with TRT collision, half-way bounce-back walls, Zou-He velocity inlet
@@ -47,8 +47,8 @@ pip install -r requirements.txt -e .
 # 3. Interactive Flow Studio (GUI)
 python gui/app.py
 
-# 4. CLI dataset generation (writes to ./dataset by default)
-python scripts/auto.py --samples 100 --shapes circle rect tri --out dataset
+# 4. CLI dataset generation (resumable; writes to ./dataset by default)
+python scripts/generate.py --n 100 --seed 0 --out dataset --images
 
 # 5. Tests (quick; use `make test-all` to include slow validation tests)
 make test
@@ -57,6 +57,11 @@ make test
 All tunable defaults (domain size, steps, sampling ranges) live in `cfd_drag/params.py`.
 
 ## Output Format
-Whether running via the GUI's batch mode or the CLI automation script, the pipeline generates a dataset directory containing:
-1. `training_data.csv`: A master record tracking the geometric inputs (shape, size1, size2, angle, velocity) and the corresponding aerodynamic targets ($C_d$ and $\Delta P$).
-2. `images/`: A folder containing the .png images of the steady-state velocity fields for each sample, acting as the visual input for downstream CNN/Computer Vision tasks.
+A dataset directory contains:
+1. `data.csv`: one row per case with the inputs (`shape`, `size1`, `size2`, `angle`, `re`, frontal height `D`, `blockage`) and the targets (`Cd`, `Cl`, `Cl_rms`, `pressure_loss`), plus `status` (steady/periodic) and `ok`.
+2. `masks.npy`: `(N, 64, 64)` uint8 obstacle masks cropped around the obstacle, aligned with `data.csv` rows. These are the CNN inputs.
+3. `images/`: optional velocity-magnitude PNGs, for visualisation only.
+
+Load it with `cfd_drag.dataset.load("dataset")`. `example_data/` holds 24 cases.
+
+On the development machine (i5-10500T, 6 workers) a case takes about 6.75 s of wall time.

@@ -19,3 +19,11 @@
 | 2026-11-17 | Poiseuille test compares profile shape and flux-corrected pressure gradient | LBM is weakly compressible: density drops ~5% along the test channel, raising u by the same amount |
 | 2026-11-17 | Solver outputs now go to --out-dir; results.csv is overwritten, not appended | Parallel runs (M2) need isolated outputs |
 | 2026-11-17 | Benchmark convergence: Cd = 5.434 (−2.6%) at D = 20, 5.555 (−0.4%) at D = 40 vs 5.5795 | Error shrinks with resolution, confirming the scheme; the test uses D = 20 for speed |
+| 2026-11-17 | Re range 20–100 (option a) | At Re 150 the tau and blockage guards force D into 20–24.5 cells, coupling Re with size; Re 100 still spans steady and shedding regimes |
+| 2026-11-17 | Solver core: fused pull-stream + TRT collide, SoA layout, branch-free interior nodes, -march=native | 1.6x faster (18 -> 29 MLUPS), same Cd to 6 digits |
+| 2026-11-17 | Steady/periodic threshold Cl_rms < 0.02 (was 1e-4) | Low-Re steady cases keep Cl_rms ~4e-3 from slow transients; shedding cases are > 0.1 |
+| 2026-11-17 | (Re, D) sampled uniformly over the feasible region, then shape/aspect/angle; sizes scaled to hit D | Guards hold by construction; no hidden rejection bias in the solver |
+| 2026-11-17 | Per-case RNG seeded by (seed, index); failed cases are kept as rows with ok = False, not redrawn | Dataset is identical for any worker count and resumable |
+| 2026-11-17 | CNN input stored as 64x64 obstacle mask cropped around the obstacle centre | Obstacle position is fixed; crop keeps files small (~4 KB/case) |
+| 2026-11-17 | Default workers = physical cores | 6 workers: 6.75 s/case; 12 workers: 8 s/case on the i5-10500T |
+| 2026-11-17 | scripts/auto.py replaced by scripts/generate.py | New sampler, parallelism, resume and mask output |

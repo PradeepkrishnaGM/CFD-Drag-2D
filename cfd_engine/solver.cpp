@@ -54,6 +54,7 @@ struct Config {
     int ramp = -1;                 // inlet ramp-up steps; default warmup / 4
     double min_tau = 0.52;         // stability guard
     double max_blockage = 0.25;    // D / H guard
+    double steady_cl_rms = 0.02;   // Cl_rms below this is reported as 'steady'
     bool box = false;              // closed box (all walls), for conservation tests
     bool dump = false;             // write mask.npy and fields.npy
     std::string out_dir = ".";
@@ -102,12 +103,17 @@ class LBMSolver {
    public:
     Config cfg;
     double D = 0.0, tau = 0.0, nu = 0.0;
-    std::vector<double> f, f_post, rho, ux, uy, u_in;
+    int N = 0;
+    // Post-collision populations, structure-of-arrays: A[i * N + k] for direction i, node k.
+    // Each step pulls from A, collides, and writes B (fused stream + collide), then swaps.
+    std::vector<double> A, B;
+    std::vector<double> rho, ux, uy, u_in;  // macroscopic fields (stored on the last step)
     std::vector<uint8_t> cell;
+    std::vector<uint8_t> interior;          // fluid node whose 9 pull sources are all fluid
+    int off[9];                             // node-index offset of the pull source per direction
     double Fx = 0.0, Fy = 0.0;
 
     inline int idx(int x, int y) const { return y * cfg.nx + x; }
-    inline int f_idx(int x, int y, int i) const { return (y * cfg.nx + x) * 9 + i; }
 
     static double equilibrium(int i, double r, double u_x, double u_y) {
         double cu = cx[i] * u_x + cy[i] * u_y;
@@ -146,13 +152,15 @@ class LBMSolver {
         nu = cfg.u * D / cfg.re;
         tau = 3.0 * nu + 0.5;
 
-        int N = cfg.nx * cfg.ny;
-        f.assign(N * 9, 0.0);
-        f_post.assign(N * 9, 0.0);
+        N = cfg.nx * cfg.ny;
+        A.assign(9 * N, 0.0);
+        B.assign(9 * N, 0.0);
         rho.assign(N, 1.0);
         ux.assign(N, 0.0);
         uy.assign(N, 0.0);
         cell.assign(N, FLUID);
+        interior.assign(N, 0);
+        for (int i = 0; i < 9; ++i) off[i] = -(cx[i] + cy[i] * cfg.nx);
 
         // Inlet profile per row (mean velocity = u)
         u_in.assign(cfg.ny, 0.0);
@@ -169,102 +177,114 @@ class LBMSolver {
                 if (wall) cell[k] = WALL;
                 else if (inside_obstacle(x, y)) cell[k] = OBSTACLE;
                 else if (cfg.box) ux[k] = u_in[y];  // open channel starts at rest (inlet ramps up)
-                for (int i = 0; i < 9; ++i) f[f_idx(x, y, i)] = equilibrium(i, rho[k], ux[k], uy[k]);
+                // Equilibrium is unchanged by collision, so it is a valid post-collision state.
+                for (int i = 0; i < 9; ++i) A[i * N + k] = equilibrium(i, rho[k], ux[k], uy[k]);
             }
         }
+        for (int y = 1; y < cfg.ny - 1; ++y)
+            for (int x = 1; x < cfg.nx - 1; ++x) {
+                int k = idx(x, y);
+                bool ok = cell[k] == FLUID;
+                for (int i = 1; i < 9 && ok; ++i) ok = cell[k + off[i]] == FLUID;
+                interior[k] = ok;
+            }
     }
 
     double fluid_mass() const {
         double m = 0.0;
-        for (int k = 0; k < cfg.nx * cfg.ny; ++k)
+        for (int k = 0; k < N; ++k)
             if (cell[k] == FLUID)
-                for (int i = 0; i < 9; ++i) m += f[k * 9 + i];
+                for (int i = 0; i < 9; ++i) m += A[i * N + k];
         return m;
     }
 
-    void apply_zou_he(double ramp) {
-        for (int y = 1; y < cfg.ny - 1; ++y) {  // velocity inlet, x = 0
-            if (cell[idx(0, y)] != FLUID) continue;
-            double u = ramp * u_in[y];
-            double r = (f[f_idx(0, y, 0)] + f[f_idx(0, y, 2)] + f[f_idx(0, y, 4)] +
-                        2.0 * (f[f_idx(0, y, 3)] + f[f_idx(0, y, 6)] + f[f_idx(0, y, 7)])) / (1.0 - u);
-            double d = 0.5 * (f[f_idx(0, y, 2)] - f[f_idx(0, y, 4)]);
-            f[f_idx(0, y, 1)] = f[f_idx(0, y, 3)] + (2.0 / 3.0) * r * u;
-            f[f_idx(0, y, 5)] = f[f_idx(0, y, 7)] - d + (1.0 / 6.0) * r * u;
-            f[f_idx(0, y, 8)] = f[f_idx(0, y, 6)] + d + (1.0 / 6.0) * r * u;
-        }
-        int x = cfg.nx - 1;
-        for (int y = 1; y < cfg.ny - 1; ++y) {  // pressure outlet (rho = 1), x = nx - 1
-            if (cell[idx(x, y)] != FLUID) continue;
-            double u = -1.0 + f[f_idx(x, y, 0)] + f[f_idx(x, y, 2)] + f[f_idx(x, y, 4)] +
-                       2.0 * (f[f_idx(x, y, 1)] + f[f_idx(x, y, 5)] + f[f_idx(x, y, 8)]);
-            double d = 0.5 * (f[f_idx(x, y, 2)] - f[f_idx(x, y, 4)]);
-            f[f_idx(x, y, 3)] = f[f_idx(x, y, 1)] - (2.0 / 3.0) * u;
-            f[f_idx(x, y, 6)] = f[f_idx(x, y, 8)] - d - (1.0 / 6.0) * u;
-            f[f_idx(x, y, 7)] = f[f_idx(x, y, 5)] + d - (1.0 / 6.0) * u;
-        }
+    // Zou-He velocity inlet (x = 0): unknown populations 1, 5, 8.
+    static void zou_he_inlet(double* g, double u) {
+        double r = (g[0] + g[2] + g[4] + 2.0 * (g[3] + g[6] + g[7])) / (1.0 - u);
+        double d = 0.5 * (g[2] - g[4]);
+        g[1] = g[3] + (2.0 / 3.0) * r * u;
+        g[5] = g[7] - d + (1.0 / 6.0) * r * u;
+        g[8] = g[6] + d + (1.0 / 6.0) * r * u;
     }
 
-    // One LBM step. Sets Fx, Fy to the momentum-exchange force on the obstacle.
-    void step(int n) {
-        // TRT collision: symmetric part relaxes with tau (sets viscosity), antisymmetric
-        // part with tau_minus chosen so that (tau - 1/2)(tau_minus - 1/2) = TRT_LAMBDA.
+    // Zou-He pressure outlet (x = nx - 1, rho = 1): unknown populations 3, 6, 7.
+    static void zou_he_outlet(double* g) {
+        double u = -1.0 + g[0] + g[2] + g[4] + 2.0 * (g[1] + g[5] + g[8]);
+        double d = 0.5 * (g[2] - g[4]);
+        g[3] = g[1] - (2.0 / 3.0) * u;
+        g[6] = g[8] - d - (1.0 / 6.0) * u;
+        g[7] = g[5] + d - (1.0 / 6.0) * u;
+    }
+
+    // One fused LBM step: pull-stream (with half-way bounce-back and Zou-He boundaries),
+    // then TRT collision. Sets Fx, Fy to the momentum-exchange force on the obstacle.
+    // Macroscopic fields are written only when store_fields is true.
+    void step(int n, bool store_fields) {
+        // TRT: symmetric part relaxes with tau (sets viscosity), antisymmetric part with
+        // tau_minus chosen so that (tau - 1/2)(tau_minus - 1/2) = TRT_LAMBDA.
         const double om_p = 1.0 / tau;
         const double om_m = 1.0 / (0.5 + TRT_LAMBDA / (tau - 0.5));
-        double feq[9];
-        for (int y = 1; y < cfg.ny - 1; ++y) {
-            for (int x = 0; x < cfg.nx; ++x) {
-                int k = idx(x, y);
-                if (cell[k] != FLUID) continue;
-                double r = 0, ru = 0, rv = 0;
-                for (int i = 0; i < 9; ++i) {
-                    double v = f[k * 9 + i];
-                    r += v;
-                    ru += cx[i] * v;
-                    rv += cy[i] * v;
-                }
-                double u_x = ru / r, u_y = rv / r;
-                rho[k] = r;
-                ux[k] = u_x;
-                uy[k] = u_y;
-                for (int i = 0; i < 9; ++i) feq[i] = equilibrium(i, r, u_x, u_y);
-                for (int i = 0; i < 9; ++i) {
-                    const int j = opp[i];
-                    const double fp = 0.5 * (f[k * 9 + i] + f[k * 9 + j]), fm = 0.5 * (f[k * 9 + i] - f[k * 9 + j]);
-                    const double ep = 0.5 * (feq[i] + feq[j]), em = 0.5 * (feq[i] - feq[j]);
-                    f_post[k * 9 + i] = f[k * 9 + i] - om_p * (fp - ep) - om_m * (fm - em);
-                }
-            }
-        }
+        // Smooth sin^2 ramp of the inlet velocity avoids a start-up shock.
+        const double ramp = n >= cfg.ramp ? 1.0 : std::pow(std::sin(0.5 * M_PI * n / cfg.ramp), 2);
+        const double* __restrict a = A.data();
+        double* __restrict b = B.data();
+        double fx = 0.0, fy = 0.0;
 
-        Fx = Fy = 0.0;
         for (int y = 1; y < cfg.ny - 1; ++y) {
             for (int x = 0; x < cfg.nx; ++x) {
-                if (cell[idx(x, y)] != FLUID) continue;
-                for (int i = 0; i < 9; ++i) {
-                    int sx = x - cx[i], sy = y - cy[i];
-                    if (sx < 0 || sx >= cfg.nx) {  // outside: overwritten by Zou-He
-                        f[f_idx(x, y, i)] = f_post[f_idx(x, y, i)];
-                        continue;
-                    }
-                    uint8_t src = cell[idx(sx, sy)];
-                    if (src == FLUID) {
-                        f[f_idx(x, y, i)] = f_post[f_idx(sx, sy, i)];
-                    } else {  // half-way bounce-back
-                        double v = f_post[f_idx(x, y, opp[i])];
-                        f[f_idx(x, y, i)] = v;
-                        if (src == OBSTACLE) {
-                            Fx += 2.0 * cx[opp[i]] * v;
-                            Fy += 2.0 * cy[opp[i]] * v;
+                const int k = idx(x, y);
+                if (cell[k] != FLUID) continue;
+                double g[9];
+                if (interior[k]) {
+                    for (int i = 0; i < 9; ++i) g[i] = a[i * N + k + off[i]];
+                } else {
+                    for (int i = 0; i < 9; ++i) {
+                        const int sx = x - cx[i], sy = y - cy[i];
+                        if (sx < 0 || sx >= cfg.nx) { g[i] = 0.0; continue; }  // set by Zou-He
+                        const int ks = idx(sx, sy);
+                        if (cell[ks] == FLUID) {
+                            g[i] = a[i * N + ks];
+                        } else {  // half-way bounce-back
+                            const double v = a[opp[i] * N + k];
+                            g[i] = v;
+                            if (cell[ks] == OBSTACLE) {
+                                fx += 2.0 * cx[opp[i]] * v;
+                                fy += 2.0 * cy[opp[i]] * v;
+                            }
                         }
                     }
+                    if (!cfg.box && x == 0) zou_he_inlet(g, ramp * u_in[y]);
+                    if (!cfg.box && x == cfg.nx - 1) zou_he_outlet(g);
+                }
+
+                double r = 0.0;
+                for (int i = 0; i < 9; ++i) r += g[i];
+                const double u_x = (g[1] - g[3] + g[5] - g[6] - g[7] + g[8]) / r;
+                const double u_y = (g[2] - g[4] + g[5] + g[6] - g[7] - g[8]) / r;
+                if (store_fields) { rho[k] = r; ux[k] = u_x; uy[k] = u_y; }
+
+                double feq[9];
+                for (int i = 0; i < 9; ++i) feq[i] = equilibrium(i, r, u_x, u_y);
+                b[k] = g[0] - om_p * (g[0] - feq[0]);
+                for (int i = 1; i <= 2; ++i) {  // opposite pairs (1,3), (2,4)
+                    const int j = i + 2;
+                    const double sp = om_p * 0.5 * ((g[i] + g[j]) - (feq[i] + feq[j]));
+                    const double sm = om_m * 0.5 * ((g[i] - g[j]) - (feq[i] - feq[j]));
+                    b[i * N + k] = g[i] - sp - sm;
+                    b[j * N + k] = g[j] - sp + sm;
+                }
+                for (int i = 5; i <= 6; ++i) {  // opposite pairs (5,7), (6,8)
+                    const int j = i + 2;
+                    const double sp = om_p * 0.5 * ((g[i] + g[j]) - (feq[i] + feq[j]));
+                    const double sm = om_m * 0.5 * ((g[i] - g[j]) - (feq[i] - feq[j]));
+                    b[i * N + k] = g[i] - sp - sm;
+                    b[j * N + k] = g[j] - sp + sm;
                 }
             }
         }
-        if (!cfg.box) {  // smooth sin^2 ramp of the inlet velocity avoids a start-up shock
-            double r = n >= cfg.ramp ? 1.0 : std::pow(std::sin(0.5 * M_PI * n / cfg.ramp), 2);
-            apply_zou_he(r);
-        }
+        Fx = fx;
+        Fy = fy;
+        A.swap(B);
     }
 
     double pressure_loss() const {
@@ -336,6 +356,7 @@ int main(int argc, char** argv) {
             else if (a == "--steps") legacy_steps = std::stoi(next());  // total; 2/3 warm-up
             else if (a == "--min-tau") cfg.min_tau = std::stod(next());
             else if (a == "--max-blockage") cfg.max_blockage = std::stod(next());
+            else if (a == "--steady-cl-rms") cfg.steady_cl_rms = std::stod(next());
             else if (a == "--out-dir") cfg.out_dir = next();
             else if (a == "--box") cfg.box = true;
             else if (a == "--dump") cfg.dump = true;
@@ -374,7 +395,7 @@ int main(int argc, char** argv) {
     double sx = 0, sy = 0, syy = 0, sx1 = 0, sx2 = 0;
     bool diverged = false;
     for (int step = 0; step < total; ++step) {
-        s.step(step);
+        s.step(step, step == total - 1);
         if (step >= cfg.warmup) {
             sx += s.Fx;
             sy += s.Fy;
@@ -397,7 +418,7 @@ int main(int argc, char** argv) {
     double cd_drift = (n1 > 0 && n2 > 0 && Fx_mean != 0.0)
                           ? std::abs(sx2 / n2 - sx1 / n1) / std::abs(Fx_mean) : 0.0;
     double mass_change = (s.fluid_mass() - mass0) / mass0;
-    std::string status = diverged ? "diverged" : (Cl_rms < 1e-4 ? "steady" : "periodic");
+    std::string status = diverged ? "diverged" : (Cl_rms < cfg.steady_cl_rms ? "steady" : "periodic");
 
     std::ofstream csv(cfg.out_dir + "/results.csv");
     csv << std::setprecision(10)

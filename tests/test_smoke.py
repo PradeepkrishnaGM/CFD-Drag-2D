@@ -19,6 +19,6 @@ def test_tiny_run_writes_outputs(solver_exe, tmp_path):
 
 
 def test_auto_cli_help():
-    out = subprocess.run([sys.executable, "scripts/auto.py", "--help"], cwd=REPO_ROOT,
+    out = subprocess.run([sys.executable, "scripts/generate.py", "--help"], cwd=REPO_ROOT,
                          capture_output=True, text=True, check=True)
     assert "--out" in out.stdout
