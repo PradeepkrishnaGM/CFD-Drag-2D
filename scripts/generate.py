@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from cfd_drag.dataset import generate  # noqa: E402
-from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING  # noqa: E402
+from cfd_drag.params import DOMAIN, GPU, PHYSICS, SAMPLING  # noqa: E402
 from cfd_drag.paths import DEFAULT_DATASET_DIR  # noqa: E402
 
 
@@ -28,11 +28,16 @@ def main():
     ap.add_argument("--out", type=Path, default=DEFAULT_DATASET_DIR)
     ap.add_argument("--shapes", nargs="+", choices=["circle", "rect", "tri"], default=list(SAMPLING.shapes))
     ap.add_argument("--images", action="store_true", help="also save velocity-magnitude PNGs")
+    ap.add_argument("--backend", choices=["cpu", "cuda"], default="cpu")
+    ap.add_argument("--gpus", type=int, default=None, help="cuda: GPUs to use (default: all visible)")
+    ap.add_argument("--batch-size", type=int, default=GPU.batch_size, help="cuda: cases per launch")
     args = ap.parse_args()
 
     sampling = replace(SAMPLING, shapes=tuple(args.shapes))
     t0 = time.time()
-    df = generate(args.out, args.n, args.seed, args.workers, DOMAIN, PHYSICS, sampling, args.images)
+    gpu = replace(GPU, batch_size=args.batch_size)
+    df = generate(args.out, args.n, args.seed, args.workers, DOMAIN, PHYSICS, sampling, args.images,
+                  backend=args.backend, gpu=gpu, gpus=args.gpus)
     ok = int(df["ok"].sum())
     print(f"{ok}/{len(df)} cases ok in {time.time() - t0:.0f} s -> {args.out}")
     if ok < len(df):

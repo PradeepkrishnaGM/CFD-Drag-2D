@@ -56,6 +56,13 @@ class SamplingParams:
     max_abs_cd: float = 100.0     # samples with |Cd| above this are discarded as blow-ups
 
 
+@dataclass(frozen=True)
+class GpuParams:
+    batch_size: int = 256         # cases per solver_cuda launch (~7.4 MB GPU memory per case)
+    timeout_s: int = 7200         # wall-clock limit per batch
+
+
 DOMAIN = DomainParams()
 PHYSICS = PhysicsParams()
 SAMPLING = SamplingParams()
+GPU = GpuParams()

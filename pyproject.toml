@@ -13,4 +13,7 @@ packages = ["cfd_drag"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
-markers = ["slow: long-running physics validation (deselect with -m 'not slow')"]
+markers = [
+    "slow: long-running physics validation (deselect with -m 'not slow')",
+    "gpu: needs build/solver_cuda and an NVIDIA GPU (skipped otherwise)",
+]

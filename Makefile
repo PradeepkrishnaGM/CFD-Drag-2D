@@ -2,6 +2,9 @@
 solver:
 	$(MAKE) -C cfd_engine
 
+cuda:
+	$(MAKE) -C cfd_engine cuda
+
 clean:
 	$(MAKE) -C cfd_engine clean
 
@@ -11,4 +14,4 @@ test: solver
 test-all: solver
 	pytest
 
-.PHONY: solver clean test test-all
+.PHONY: solver cuda clean test test-all
