@@ -27,3 +27,8 @@
 | 2026-11-17 | CNN input stored as 64x64 obstacle mask cropped around the obstacle centre | Obstacle position is fixed; crop keeps files small (~4 KB/case) |
 | 2026-11-17 | Default workers = physical cores | 6 workers: 6.75 s/case; 12 workers: 8 s/case on the i5-10500T |
 | 2026-11-17 | scripts/auto.py replaced by scripts/generate.py | New sampler, parallelism, resume and mask output |
+| 2026-11-18 | CPU and CUDA solvers share one per-node update (lbm_common.hpp) | One physics implementation, tested on the CPU; CPU cost +6% (8.2 -> 8.7 s per benchmark run) |
+| 2026-11-18 | CUDA solver runs a batch of cases per launch, double precision, fixed-order force reduction | A 400x100 case cannot fill a GPU; deterministic results for any batch size |
+| 2026-11-18 | Kaggle T4 (P100 retired): GPU results equal CPU results to the 10 digits stored, for steady and shedding cases | Verified on 16 cases (Kaggle run, 2026-11-18) |
+| 2026-11-18 | GPU throughput 1.38 s/case on one T4 (128-case batch) vs 6.75 s/case locally | ~5x per GPU; Kaggle's 2 T4s give ~0.7 s/case when there are >= 2 batches |
+| 2026-11-18 | Kaggle notebooks clone the public repo and build with the image's nvcc; scripts/kaggle_setup_cuda.sh falls back to NVIDIA's redistributable | No GPU or CUDA toolkit on the dev machine |
