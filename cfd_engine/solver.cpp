@@ -1,6 +1,6 @@
 /**
  * Standalone 2D Lattice Boltzmann Method (LBM) Solver
- * Compile with: g++ -O3 -std=c++17 lbm_solver.cpp -o lbm_solver
+ * Build with: make solver  (from the repo root; output: build/solver)
  */
 
 #include <iostream>

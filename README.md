@@ -1,50 +1,52 @@
 # CFD-Drag-2D: Aerodynamic Dataset Generator & Flow Studio
 
-![C++](https://img.shields.io/badge/C++-17-blue) ![CUDA](https://img.shields.io/badge/CUDA-Enabled-green) ![Python](https://img.shields.io/badge/Python-3.8+-yellow) ![License](https://img.shields.io/badge/License-MIT-green)
+![C++](https://img.shields.io/badge/C++-17-blue) ![Python](https://img.shields.io/badge/Python-3.8+-yellow) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Overview
-This repository contains a high-performance 2D Computational Fluid Dynamics (CFD) solver based on the D2Q9 Lattice Boltzmann Method (LBM), implemented "from scratch" in both standard C++ and CUDA. 
+This repository contains a high-performance 2D Computational Fluid Dynamics (CFD) solver based on the D2Q9 Lattice Boltzmann Method (LBM), implemented from scratch in C++ (a CUDA port is planned). 
 
 Designed as a complete aerodynamic "data factory," the project features a custom interactive GUI for real-time flow visualization and a Python automation pipeline. It is purpose-built to rapidly generate large-scale, geometry-aware fluid flow datasets and compute precise aerodynamic metrics (Drag Coefficient, Pressure Loss) for machine learning and surrogate model training.
 
 ## Features
-* **Hybrid Compute Engine:** Includes a standard C++ solver for high compatibility, and a memory-efficient CUDA solver for ultra-fast, PCIe-optimized GPU batch generation.
+* **C++ Compute Engine:** A dependency-free D2Q9 LBM solver driven from the command line (CUDA port planned).
 * **Interactive GUI Studio:** A responsive, dark-themed PyQt6 desktop application to manually design obstacles, tune physics parameters, and visualize flow fields instantly.
 * **Custom Geometry Handling:** Simulates fluid interaction around circles, rectangles, and triangles with dynamic sizes and variable Angles of Attack (AoA).
-* **Native Physics Calculation:** Accurately calculates the Drag Coefficient ($C_d$) via the Momentum Exchange Method directly inside the C++/CUDA simulation loop.
+* **Native Physics Calculation:** Accurately calculates the Drag Coefficient ($C_d$) via the Momentum Exchange Method directly inside the C++ simulation loop.
 * **Batch Automation:** Features a robust Python wrapper (`auto.py`) to procedurally generate balanced datasets of thousands of `(Image, Metric)` samples with built-in numerical stability checks.
 
+## Status
+Work in progress. Planned next: solver validation against benchmarks, a CUDA solver,
+large-scale dataset generation, and a CNN surrogate that predicts drag from geometry.
+See `SPEC.md` for the full plan and `DECISIONS.md` for design choices.
+
 ## Prerequisites
-* **C++ Compiler:** GCC/G++ with C++17 support.
-* **CUDA Support (Optional):** NVIDIA CUDA Toolkit (requires `nvcc`).
-* **Python Environment:** Python 3.8+
-* **Dependencies:** `PyQt6`, `Pillow`, `pandas`, `tqdm` (Can be installed via `pip install -r requirements.txt`)
+* **C++ Compiler:** GCC/G++ with C++17 support, and `make`.
+* **Python:** 3.10+ (3.12 recommended). Dependencies are listed in `requirements.txt`.
 
 ## Quick Start
-
-### 1. Compile the Solver(s)
-You can compile the standard CPU solver or the GPU-accelerated version depending on your hardware.
+All commands run from the repository root.
 
 ```bash
-g++ -O3 -std=c++17 solver.cpp -o solver
+# 1. Build the solver (-> build/solver)
+make solver
+
+# 2. Python environment
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -e .
+
+# 3. Interactive Flow Studio (GUI)
+python gui/app.py
+
+# 4. CLI dataset generation (writes to ./dataset by default)
+python scripts/auto.py --samples 100 --shapes circle rect tri --out dataset
+
+# 5. Tests (quick; use `make test-all` to include slow validation tests)
+make test
 ```
 
-### 2. Launch the Interactive Flow Studio (GUI)
-Explore the physics interactively by running the desktop application. The GUI allows for both single manual runs and automated batch generation.
-
-```bash
-python app.py
-```
-(Note: Ensure the compiled executable is in the same directory as the script.)
-
-### 3. CLI Dataset Generation
-To bypass the GUI and autonomously generate a large-scale training dataset using the terminal:
-
-```bash
-python auto.py --samples 1000 --shapes circle rect tri
-```
+All tunable defaults (domain size, steps, sampling ranges) live in `cfd_drag/params.py`.
 
 ## Output Format
-Whether running via the GUI's batch mode or the CLI automation script, the pipeline will generate a dataset/ directory containing:
+Whether running via the GUI's batch mode or the CLI automation script, the pipeline generates a dataset directory containing:
 1. `training_data.csv`: A master record tracking the geometric inputs (shape, size1, size2, angle, velocity) and the corresponding aerodynamic targets ($C_d$ and $\Delta P$).
-2. `images/`: A folder containing the high-resolution .png representations of the steady-state velocity fields for each sample, acting as the visual input for downstream CNN/Computer Vision tasks.
+2. `images/`: A folder containing the .png images of the steady-state velocity fields for each sample, acting as the visual input for downstream CNN/Computer Vision tasks.

@@ -7,6 +7,9 @@ import subprocess
 from pathlib import Path
 from PIL import Image
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from cfd_drag.paths import SOLVER_EXE  # noqa: E402
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QPushButton, QComboBox, QSlider, QDoubleSpinBox, 
@@ -249,7 +252,7 @@ class LBMSolverGUI(QMainWindow):
         # Domain configuration
         self.domain_nx = 400
         self.domain_ny = 100
-        self.executable = "./solver.exe" if sys.platform == "win32" else "./solver"
+        self.executable = str(SOLVER_EXE)
         
         self.process = None
         self.batch_worker = None
