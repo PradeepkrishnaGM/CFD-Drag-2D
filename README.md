@@ -112,7 +112,19 @@ solver, re-solves 8 random cases on the CPU as a reproducibility check, and runs
 | Generation time | 59 min on 2x T4 (0.70 s per case) |
 | Size | 21 MB (`data.csv`, `masks.npy`, config and check files) |
 
-The dataset is a private Kaggle dataset for now (link to follow when it is made public).
+**Download:** the dataset (`cfd_drag_2d_v1.zip`, 0.5 MB) and the trained model are attached to the
+[v1.0 release](https://github.com/PradeepkrishnaGM/CFD-Drag-2D/releases/tag/v1.0). To use it:
+
+```bash
+unzip cfd_drag_2d_v1.zip
+python scripts/check_dataset.py --data cfd_drag_2d   # re-runs the quality checks
+python scripts/train.py --data cfd_drag_2d --out runs/my_run
+```
+
+```python
+from cfd_drag.dataset import load
+df, masks = load("cfd_drag_2d")   # data.csv as a DataFrame, masks as (5000, 64, 64) uint8
+```
 
 ## Surrogate model
 A small CNN (4 conv blocks, 0.26 M parameters) predicts Cd and Cl from the 64x64 obstacle mask;

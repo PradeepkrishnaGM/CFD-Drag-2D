@@ -46,3 +46,4 @@
 | 2026-11-18 | Trained surrogate committed as models/surrogate_v1.pt (1 MB, seed 0) | GUI works right after cloning; small enough for git |
 | 2026-11-18 | GUI inputs are shape, sizes, angle and Re (inlet velocity and legacy --steps removed); invalid cases disable RUN SOLVER, out-of-range cases get a warning but still a CNN prediction | Same settings as the dataset, so CNN and solver are comparable |
 | 2026-11-18 | GUI dataset mode calls cfd_drag.dataset.generate (progress callback added); old GUI batch code removed | One pipeline, same seeds and checks as the CLI |
+| 2026-11-18 | Dataset v1 published as a GitHub release asset (v1.0, zip + model), not committed to git; Kaggle copy stays private | Owner: dataset on GitHub, not Kaggle; keeps the git history small |
