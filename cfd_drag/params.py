@@ -99,6 +99,21 @@ class TrainParams:
     gbm_learning_rate: float = 0.05
 
 
+@dataclass(frozen=True)
+class FieldTrainParams:
+    """U-Net flow-field surrogate (v2, M8). The split is the same as TrainParams (same test rows)."""
+    base_channels: int = 32                 # U-Net width at full resolution, doubled per level
+    levels: int = 4                         # down-sampling steps (96 x 256 -> 6 x 16)
+    sdf_scale: float = 32.0                 # signed distance input is divided by this [cells]
+    loss_weights: tuple[float, ...] = (1.0, 1.0, 1.0)  # MSE weights for ux, uy, Cp (standardised)
+    lr: float = 1e-3                        # AdamW, cosine schedule to 0
+    weight_decay: float = 1e-4
+    batch_size: int = 32
+    epochs: int = 100                       # best epoch by validation error is kept
+    seed: int = 0                           # weight init and batch order
+    amp: bool = True                        # float16 mixed precision on CUDA (ignored on CPU)
+
+
 DOMAIN = DomainParams()
 PHYSICS = PhysicsParams()
 SAMPLING = SamplingParams()
@@ -106,3 +121,4 @@ GPU = GpuParams()
 FIELD = FieldParams()
 CHECK = CheckParams()
 TRAIN = TrainParams()
+FIELD_TRAIN = FieldTrainParams()
