@@ -62,7 +62,13 @@ class GpuParams:
     timeout_s: int = 7200         # wall-clock limit per batch
 
 
+@dataclass(frozen=True)
+class CheckParams:
+    min_ok_fraction: float = 0.95  # dataset check fails if fewer cases than this solved cleanly
+
+
 DOMAIN = DomainParams()
 PHYSICS = PhysicsParams()
 SAMPLING = SamplingParams()
 GPU = GpuParams()
+CHECK = CheckParams()

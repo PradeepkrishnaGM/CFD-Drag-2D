@@ -32,3 +32,5 @@
 | 2026-11-18 | Kaggle T4 (P100 retired): GPU results equal CPU results to the 10 digits stored, for steady and shedding cases | Verified on 16 cases (Kaggle run, 2026-11-18) |
 | 2026-11-18 | GPU throughput 1.38 s/case on one T4 (128-case batch) vs 6.75 s/case locally | ~5x per GPU; Kaggle's 2 T4s give ~0.7 s/case when there are >= 2 batches |
 | 2026-11-18 | Kaggle notebooks clone the public repo and build with the image's nvcc; scripts/kaggle_setup_cuda.sh falls back to NVIDIA's redistributable | No GPU or CUDA toolkit on the dev machine |
+| 2026-11-18 | M4 dataset: N = 5000 cases, seed 0, CUDA back-end on Kaggle 2x T4, no velocity images | ~1 h of GPU; images are visualisation only and large |
+| 2026-11-18 | Kaggle dataset private until M6; dataset check fails below 95 % ok cases | Owner approval |
