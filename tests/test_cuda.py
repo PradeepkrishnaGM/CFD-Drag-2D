@@ -8,7 +8,7 @@ import pytest
 
 from cfd_drag.dataset import generate
 from cfd_drag.params import PHYSICS, SAMPLING, DomainParams, GpuParams
-from cfd_drag.paths import REPO_ROOT, SOLVER_CUDA_EXE
+from cfd_drag.paths import SOLVER_CUDA_EXE
 from solver_run import read_results, run_solver
 
 
@@ -23,7 +23,7 @@ pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not _gpu_available(), reason="
 TINY_DOMAIN = DomainParams(nx=120, ny=40, timeout_s=120)
 TINY_PHYSICS = replace(PHYSICS, warmup_flowthroughs=1.0, avg_flowthroughs=0.5)
 TINY_SAMPLING = replace(SAMPLING, crop=32, d_min=4.0, min_thickness=2.0)
-COMMON = ["--width", "120", "--height", "40", "--warmup", "1500", "--avg", "500", "--dump"]
+COMMON = ["--width", "120", "--height", "40", "--warmup", "1500", "--avg", "500", "--dump", "--mean-fields"]
 CASES = [("circle", 4.0, 4.0, 0.0, 30.0), ("rect", 3.0, 6.0, 25.0, 45.0), ("tri", 5.0, 7.0, 60.0, 25.0)]
 
 
@@ -53,6 +53,8 @@ def test_cuda_matches_cpu(solver_exe, tmp_path):
             assert g[k] == pytest.approx(c[k], rel=1e-6, abs=1e-9), (shape, k)
         fg, fc = np.load(root / str(i) / "fields.npy"), np.load(cpu / "fields.npy")
         assert np.abs(fg - fc).max() < 1e-9
+        mg, mc = np.load(root / str(i) / "fields_mean.npy"), np.load(cpu / "fields_mean.npy")
+        assert np.abs(mg - mc).max() < 1e-9
         assert np.array_equal(np.load(root / str(i) / "mask.npy"), np.load(cpu / "mask.npy"))
 
 

@@ -69,6 +69,7 @@ struct Config {
     double steady_cl_rms = 0.02;   // Cl_rms below this is reported as 'steady'
     bool box = false;              // closed box (all walls), for conservation tests
     bool dump = false;             // write mask.npy and fields.npy
+    bool mean_fields = false;      // write fields_mean.npy (ux, uy, rho averaged over the --avg window)
     std::string out_dir = ".";
     std::string batch;             // CUDA only: CSV of cases (out_dir,shape,size1,size2,angle,re)
 };
@@ -105,6 +106,7 @@ inline void parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "--batch") cfg.batch = next();
         else if (a == "--box") cfg.box = true;
         else if (a == "--dump") cfg.dump = true;
+        else if (a == "--mean-fields") cfg.mean_fields = true;
         else throw std::runtime_error("unknown argument " + a);
     }
 }
@@ -293,12 +295,14 @@ inline double ramp_factor(int n, int ramp) {
  * Update node (x, y): pull-stream from post-collision populations `a` (with half-way
  * bounce-back and Zou-He boundaries), then TRT-collide into `b`. Adds the node's
  * momentum-exchange force on the obstacle to (fx, fy). If rho is non-null, stores the
- * macroscopic fields. Non-fluid and wall-row nodes are left untouched.
+ * macroscopic fields. If acc is non-null, adds (ux, uy, rho) to acc[k], acc[N + k], acc[2N + k]
+ * (running sums for the time-averaged fields). Non-fluid and wall-row nodes are left untouched.
  */
 LBM_HD inline void node_update(int x, int y, const StepParams& p, const uint8_t* cell,
                                const uint8_t* interior, const double* u_in,
                                const double* __restrict__ a, double* __restrict__ b,
-                               double& fx, double& fy, double* rho, double* ux, double* uy) {
+                               double& fx, double& fy, double* rho, double* ux, double* uy,
+                               double* acc = nullptr) {
     constexpr int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
     constexpr int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
     constexpr int opp[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
@@ -351,6 +355,7 @@ LBM_UNROLL
     const double u_x = (g[1] - g[3] + g[5] - g[6] - g[7] + g[8]) / r;
     const double u_y = (g[2] - g[4] + g[5] + g[6] - g[7] - g[8]) / r;
     if (rho) { rho[k] = r; ux[k] = u_x; uy[k] = u_y; }
+    if (acc) { acc[k] += u_x; acc[N + k] += u_y; acc[2 * N + k] += r; }
 
     double feq[9];
 LBM_UNROLL
@@ -385,6 +390,7 @@ LBM_HD inline void accumulate(ForceStats& s, int step, int warmup, int avg, doub
 
 struct Fields {  // macroscopic fields of one case
     std::vector<double> rho, ux, uy;
+    std::vector<double> mean;  // with --mean-fields: sums of (ux, uy, rho) over the averaging window, 3 x N
 };
 
 inline double pressure_loss(const Config& c, const Geometry& g, const Fields& f) {
@@ -467,6 +473,18 @@ inline std::string write_outputs(const Config& c, const Geometry& g, const Field
         all.insert(all.end(), f.uy.begin(), f.uy.end());
         all.insert(all.end(), f.rho.begin(), f.rho.end());
         write_npy(c.out_dir + "/fields.npy", all, {3, ny, nx}, "<f8");
+    }
+    if (c.mean_fields && f.mean.size() == 3 * (size_t)g.N) {
+        // Time average over the --avg window; non-fluid nodes get u = 0, rho = 1.
+        size_t ny = c.ny, nx = c.nx, N = g.N;
+        std::vector<double> m(3 * N);
+        for (size_t k = 0; k < N; ++k) {
+            const bool fl = g.cell[k] == FLUID && k >= nx && k < N - nx;
+            m[k] = fl ? f.mean[k] / c.avg : 0.0;
+            m[N + k] = fl ? f.mean[N + k] / c.avg : 0.0;
+            m[2 * N + k] = fl ? f.mean[2 * N + k] / c.avg : 1.0;
+        }
+        write_npy(c.out_dir + "/fields_mean.npy", m, {3, ny, nx}, "<f8");
     }
     std::cout << "=> Cd " << Cd << " | Cl " << Cl << " | Cl_rms " << Cl_rms << " | status " << status << "\n";
     return status;

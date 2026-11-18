@@ -57,6 +57,20 @@ class SamplingParams:
 
 
 @dataclass(frozen=True)
+class FieldParams:
+    """Time-averaged flow-field window stored with a field dataset (v2, M7).
+
+    The window spans x in [cx - x_before, cx - x_before + width) and
+    y in [cy - height/2, cy + height/2) around the obstacle centre (cx, cy); both sizes are
+    divisible by 32 for the U-Net. Stored channels: ux / U, uy / U and the pressure coefficient
+    Cp = (p - p_out) / (0.5 U^2) with p = rho / 3 and p_out = 1/3 (outlet), as float16.
+    """
+    width: int = 256          # cells along the flow (near wake up to 7 obstacle sizes downstream)
+    height: int = 96          # cells across (channel rows 2..97 for ny = 100; wall rows dropped)
+    x_before: int = 32        # cells upstream of the obstacle centre (= half the mask crop)
+
+
+@dataclass(frozen=True)
 class GpuParams:
     batch_size: int = 256         # cases per solver_cuda launch (~7.4 MB GPU memory per case)
     timeout_s: int = 7200         # wall-clock limit per batch
@@ -89,5 +103,6 @@ DOMAIN = DomainParams()
 PHYSICS = PhysicsParams()
 SAMPLING = SamplingParams()
 GPU = GpuParams()
+FIELD = FieldParams()
 CHECK = CheckParams()
 TRAIN = TrainParams()

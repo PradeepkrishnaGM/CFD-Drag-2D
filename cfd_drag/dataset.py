@@ -10,6 +10,8 @@ Layout of a dataset directory:
     images/NNNNNN.png    optional velocity-magnitude image (visualisation only)
     data.csv             consolidated table, one row per case, ordered by index
     masks.npy            (N, crop, crop) uint8, row i belongs to data.csv row i
+    fields.npy           only with fields: (N, 3, height, width) float16 time-averaged
+                         (ux / U, uy / U, Cp) in the FieldParams window; zeros for failed cases
 
 Masks are 1 on obstacle nodes, 0 elsewhere. Row index = lattice y (upwards), column = x
 (downstream). Failed cases keep their row (ok = False) and an all-zero mask.
@@ -32,7 +34,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
-from .params import DomainParams, GpuParams, PhysicsParams, SamplingParams
+from .params import DomainParams, FieldParams, GpuParams, PhysicsParams, SamplingParams
 from .paths import SOLVER_CUDA_EXE, SOLVER_EXE
 from .sampling import Case, sample_case
 
@@ -41,9 +43,9 @@ COLUMNS = (["index", "shape", "size1", "size2", "angle", "re", "D", "blockage"]
            + RESULT_FIELDS + ["ok", "error"])
 
 
-def global_args(domain: DomainParams, physics: PhysicsParams) -> list[str]:
+def global_args(domain: DomainParams, physics: PhysicsParams, mean_fields: bool = False) -> list[str]:
     """Solver options shared by every case."""
-    return ["--width", str(domain.nx), "--height", str(domain.ny), "--u", repr(physics.u),
+    return [*(["--mean-fields"] if mean_fields else []), "--width", str(domain.nx), "--height", str(domain.ny), "--u", repr(physics.u),
             "--min-tau", repr(physics.min_tau), "--max-blockage", repr(physics.max_blockage),
             "--steady-cl-rms", repr(physics.steady_cl_rms),
             "--warmup", str(physics.warmup_steps(domain.nx)),
@@ -51,8 +53,8 @@ def global_args(domain: DomainParams, physics: PhysicsParams) -> list[str]:
 
 
 def solver_command(case: Case, out_dir: Path, domain: DomainParams, physics: PhysicsParams,
-                   exe: Path = SOLVER_EXE) -> list[str]:
-    return [str(exe), "--out-dir", str(out_dir), *global_args(domain, physics),
+                   exe: Path = SOLVER_EXE, mean_fields: bool = False) -> list[str]:
+    return [str(exe), "--out-dir", str(out_dir), *global_args(domain, physics, mean_fields),
             "--shape", case.shape, "--size1", repr(case.size1), "--size2", repr(case.size2),
             "--angle", repr(case.angle), "--re", repr(case.re)]
 
@@ -63,10 +65,46 @@ def crop_mask(full_mask: np.ndarray, domain: DomainParams, crop: int) -> np.ndar
     return (full_mask[cy - h:cy - h + crop, cx - h:cx - h + crop] == 1).astype(np.uint8)
 
 
-def collect_case(case: Case, case_dir: Path, error: str, domain: DomainParams,
-                 sampling: SamplingParams, images_dir: Path | None) -> tuple[dict, np.ndarray]:
-    """Turn one case's solver output directory into (row, cropped mask).
+def field_window(domain: DomainParams, fields: FieldParams) -> tuple[slice, slice]:
+    """(rows, cols) slices of the full lattice covered by the field window."""
+    cx, cy = domain.centre
+    x0, y0 = cx - fields.x_before, cy - fields.height // 2
+    if x0 < 0 or x0 + fields.width > domain.nx or y0 < 1 or y0 + fields.height > domain.ny - 1:
+        raise ValueError("field window does not fit inside the channel")
+    return slice(y0, y0 + fields.height), slice(x0, x0 + fields.width)
 
+
+def crop_field(mean: np.ndarray, domain: DomainParams, physics: PhysicsParams,
+               fields: FieldParams) -> np.ndarray:
+    """Solver fields_mean (ux, uy, rho) -> float16 (ux / U, uy / U, Cp) in the window."""
+    rows, cols = field_window(domain, fields)
+    ux, uy, rho = (m[rows, cols] for m in mean)
+    u = physics.u
+    cp = (rho - 1.0) / 3.0 / (0.5 * u * u)
+    return np.stack([ux / u, uy / u, cp]).astype(np.float16)
+
+
+def window_mask(mask: np.ndarray, domain: DomainParams, sampling: SamplingParams,
+                fields: FieldParams) -> np.ndarray:
+    """Place a cropped obstacle mask (crop x crop) into the field window."""
+    rows, cols = field_window(domain, fields)
+    cx, cy = domain.centre
+    h = sampling.crop // 2
+    out = np.zeros((fields.height, fields.width), mask.dtype)
+    y0, x0 = cy - h - rows.start, cx - h - cols.start
+    if y0 < 0 or x0 < 0 or y0 + sampling.crop > fields.height or x0 + sampling.crop > fields.width:
+        raise ValueError("mask crop does not fit inside the field window")
+    out[y0:y0 + sampling.crop, x0:x0 + sampling.crop] = mask
+    return out
+
+
+def collect_case(case: Case, case_dir: Path, error: str, domain: DomainParams,
+                 sampling: SamplingParams, images_dir: Path | None,
+                 physics: PhysicsParams | None = None,
+                 fields: FieldParams | None = None) -> tuple[dict, np.ndarray, np.ndarray | None]:
+    """Turn one case's solver output directory into (row, cropped mask, field window).
+
+    The field is None unless `fields` (and `physics`) are given; failed cases get zeros.
     `error` is a back-end level failure (timeout, crash); it applies only if the case
     produced no results of its own.
     """
@@ -74,12 +112,13 @@ def collect_case(case: Case, case_dir: Path, error: str, domain: DomainParams,
     row.update({k: math.nan for k in RESULT_FIELDS})
     row["status"] = ""
     mask = np.zeros((sampling.crop, sampling.crop), np.uint8)
+    field = None if fields is None else np.zeros((3, fields.height, fields.width), np.float16)
     if (case_dir / "rejected.txt").exists():
         row["error"] = "rejected: " + (case_dir / "rejected.txt").read_text().strip()
-        return row, mask
+        return row, mask, field
     if not (case_dir / "results.csv").exists():
         row["error"] = error or "no results"
-        return row, mask
+        return row, mask, field
     with open(case_dir / "results.csv") as f:
         res = next(csv.DictReader(f))
     for k in RESULT_FIELDS:
@@ -92,20 +131,27 @@ def collect_case(case: Case, case_dir: Path, error: str, domain: DomainParams,
     else:
         row["ok"] = True
         mask = crop_mask(np.load(case_dir / "mask.npy"), domain, sampling.crop)
+        if fields is not None:
+            field = crop_field(np.load(case_dir / "fields_mean.npy"), domain, physics, fields)
+            if not np.isfinite(field).all():
+                row["ok"], row["error"] = False, "non-finite field"
+                mask, field = np.zeros_like(mask), np.zeros_like(field)
         if images_dir is not None:
             with Image.open(case_dir / "flow_field.ppm") as img:
                 img.save(images_dir / f"{case.index:06d}.png")
-    return row, mask
+    return row, mask, field
 
 
 def run_case(case: Case, domain: DomainParams, physics: PhysicsParams,
-             sampling: SamplingParams, images_dir: Path | None = None) -> tuple[dict, np.ndarray]:
+             sampling: SamplingParams, images_dir: Path | None = None,
+             fields: FieldParams | None = None) -> tuple[dict, np.ndarray, np.ndarray | None]:
     """Run one case with the CPU solver in a private temp dir."""
     with tempfile.TemporaryDirectory(prefix="cfd_run_") as tmp:
         tmp = Path(tmp)
         error = ""
         try:
-            proc = subprocess.run(solver_command(case, tmp, domain, physics),
+            proc = subprocess.run(solver_command(case, tmp, domain, physics,
+                                                 mean_fields=fields is not None),
                                   capture_output=True, text=True, timeout=domain.timeout_s)
             if proc.returncode == 2:  # rejected before running
                 (tmp / "rejected.txt").write_text(proc.stderr.strip())
@@ -113,12 +159,13 @@ def run_case(case: Case, domain: DomainParams, physics: PhysicsParams,
                 error = f"exit {proc.returncode}"
         except subprocess.TimeoutExpired:
             error = "timeout"
-        return collect_case(case, tmp, error, domain, sampling, images_dir)
+        return collect_case(case, tmp, error, domain, sampling, images_dir, physics, fields)
 
 
 def run_cuda_batch(cases: list[Case], domain: DomainParams, physics: PhysicsParams,
                    sampling: SamplingParams, gpu: GpuParams, device: int | None = None,
-                   images_dir: Path | None = None) -> list[tuple[dict, np.ndarray]]:
+                   images_dir: Path | None = None,
+                   fields: FieldParams | None = None) -> list[tuple[dict, np.ndarray, np.ndarray | None]]:
     """Run a batch of cases in one solver_cuda process (optionally pinned to `device`)."""
     with tempfile.TemporaryDirectory(prefix="cfd_batch_") as tmp:
         tmp = Path(tmp)
@@ -134,31 +181,34 @@ def run_cuda_batch(cases: list[Case], domain: DomainParams, physics: PhysicsPara
         error = ""
         try:
             proc = subprocess.run([str(SOLVER_CUDA_EXE), "--batch", str(tmp / "cases.csv"),
-                                   *global_args(domain, physics)],
+                                   *global_args(domain, physics, fields is not None)],
                                   capture_output=True, text=True, timeout=gpu.timeout_s, env=env)
             if proc.returncode != 0:
                 error = f"cuda exit {proc.returncode}: {proc.stderr.strip()[-300:]}"
         except subprocess.TimeoutExpired:
             error = "timeout"
-        return [collect_case(c, d, error, domain, sampling, images_dir) for c, d in zip(cases, dirs)]
+        return [collect_case(c, d, error, domain, sampling, images_dir, physics, fields)
+                for c, d in zip(cases, dirs)]
 
 
 def _sample_path(out: Path, index: int) -> Path:
     return out / "samples" / f"{index:06d}.npz"
 
 
-def _save(out: Path, index: int, row: dict, mask: np.ndarray) -> None:
+def _save(out: Path, index: int, row: dict, mask: np.ndarray, field: np.ndarray | None = None) -> None:
     path = _sample_path(out, index)
     tmp = path.with_name(path.stem + ".tmp.npz")
-    np.savez_compressed(tmp, mask=mask, meta=np.array(json.dumps(row)))
+    extra = {} if field is None else {"field": field}
+    np.savez_compressed(tmp, mask=mask, meta=np.array(json.dumps(row)), **extra)
     os.replace(tmp, path)  # atomic: a half-written file never counts as done
 
 
 def _cpu_worker(args) -> int:
-    index, seed, out, domain, physics, sampling, images = args
+    index, seed, out, domain, physics, sampling, images, fields = args
     case = sample_case(seed, index, domain, physics, sampling)
-    row, mask = run_case(case, domain, physics, sampling, out / "images" if images else None)
-    _save(out, index, row, mask)
+    row, mask, field = run_case(case, domain, physics, sampling, out / "images" if images else None,
+                                fields)
+    _save(out, index, row, mask, field)
     return index
 
 
@@ -170,18 +220,22 @@ def count_gpus() -> int:
         return 1
 
 
-def _config(seed: int, backend: str, domain, physics, sampling) -> dict:
-    return {"seed": seed, "backend": backend, "domain": asdict(domain), "physics": asdict(physics),
-            "sampling": {k: list(v) if isinstance(v, tuple) else v
-                         for k, v in asdict(sampling).items()}}
+def _config(seed: int, backend: str, domain, physics, sampling, fields=None) -> dict:
+    cfg = {"seed": seed, "backend": backend, "domain": asdict(domain), "physics": asdict(physics),
+           "sampling": {k: list(v) if isinstance(v, tuple) else v
+                        for k, v in asdict(sampling).items()}}
+    if fields is not None:  # absent for scalar-only datasets (v1 configs stay unchanged)
+        cfg["fields"] = asdict(fields)
+    return cfg
 
 
 def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
              physics: PhysicsParams, sampling: SamplingParams, images: bool = False,
              progress: bool = True, backend: str = "cpu", gpu: GpuParams = GpuParams(),
-             gpus: int | None = None, callback=None) -> pd.DataFrame:
+             gpus: int | None = None, callback=None, fields: FieldParams | None = None) -> pd.DataFrame:
     """Generate cases 0..n-1 (skipping ones already on disk) and consolidate.
 
+    With `fields`, the solver also averages the flow field and fields.npy is written.
     `workers` applies to the cpu back-end; `gpus` (default: all visible) to cuda.
     `callback(done, total)` is called after each finished case (cpu) or batch (cuda).
     """
@@ -193,7 +247,9 @@ def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
     images_dir = out / "images" if images else None
     if images_dir:
         images_dir.mkdir(exist_ok=True)
-    cfg = _config(seed, backend, domain, physics, sampling)
+    if fields is not None:
+        field_window(domain, fields)  # fail early if the window does not fit
+    cfg = _config(seed, backend, domain, physics, sampling, fields)
     cfg_path = out / "config.json"
     if cfg_path.exists():
         if json.loads(cfg_path.read_text()) != cfg:
@@ -213,7 +269,7 @@ def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
             if callback:
                 callback(done, len(todo))
     if backend == "cpu" and todo:
-        jobs = [(i, seed, out, domain, physics, sampling, images) for i in todo]
+        jobs = [(i, seed, out, domain, physics, sampling, images, fields) for i in todo]
         ctx = multiprocessing.get_context("spawn")  # fork is unsafe in threaded parents
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
             for _ in pool.map(_cpu_worker, jobs, chunksize=1):
@@ -229,29 +285,39 @@ def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
             try:
                 cases = [sample_case(seed, i, domain, physics, sampling) for i in indices]
                 results = run_cuda_batch(cases, domain, physics, sampling, gpu,
-                                         device if n_gpus > 1 else None, images_dir)
+                                         device if n_gpus > 1 else None, images_dir, fields)
             finally:
                 free.put(device)
-            for c, (row, mask) in zip(cases, results):
-                _save(out, c.index, row, mask)
+            for c, (row, mask, field) in zip(cases, results):
+                _save(out, c.index, row, mask, field)
             advance(len(indices))
 
         chunks = [todo[i:i + gpu.batch_size] for i in range(0, len(todo), gpu.batch_size)]
         with ThreadPoolExecutor(max_workers=n_gpus) as pool:
             list(pool.map(run_chunk, chunks))
     bar.close()
-    return consolidate(out, n)
+    return consolidate(out, n, fields)
 
 
-def consolidate(out: Path, n: int) -> pd.DataFrame:
+def consolidate(out: Path, n: int, fields: FieldParams | None = None) -> pd.DataFrame:
     rows, masks = [], []
+    big = None
+    if fields is not None:  # written row by row: the full array can be ~0.7 GB
+        big = np.lib.format.open_memmap(out / "fields.npy.tmp", mode="w+", dtype=np.float16,
+                                        shape=(n, 3, fields.height, fields.width))
     for i in range(n):
         with np.load(_sample_path(out, i)) as z:
             rows.append(json.loads(str(z["meta"])))
             masks.append(z["mask"])
+            if big is not None:
+                big[i] = z["field"]
     df = pd.DataFrame(rows, columns=COLUMNS)
     df.to_csv(out / "data.csv", index=False, float_format="%.10g")
     np.save(out / "masks.npy", np.stack(masks))
+    if big is not None:
+        big.flush()
+        del big
+        os.replace(out / "fields.npy.tmp", out / "fields.npy")
     return df
 
 
@@ -263,3 +329,8 @@ def load(out: Path, only_ok: bool = True) -> tuple[pd.DataFrame, np.ndarray]:
         keep = df["ok"].to_numpy(bool)
         df, masks = df[keep].reset_index(drop=True), masks[keep]
     return df, masks
+
+
+def load_fields(out: Path) -> np.ndarray:
+    """All rows of fields.npy (memory-mapped, float16); index with data.csv's row order."""
+    return np.load(Path(out) / "fields.npy", mmap_mode="r")

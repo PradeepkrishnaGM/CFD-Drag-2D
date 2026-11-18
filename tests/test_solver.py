@@ -94,3 +94,22 @@ def test_schafer_turek_cylinder(solver_exe, tmp_path):
     assert r["status"] == "steady"
     assert r["Cd"] == pytest.approx(5.5795, rel=0.05)
     assert abs(r["Cl"]) < 0.05
+
+
+def test_mean_fields_are_time_averages(solver_exe, tmp_path):
+    """fields_mean over a 2-step window = average of the snapshots at those two steps."""
+    common = ["--width", "80", "--height", "30", "--shape", "circle", "--size1", "3", "--re", "40",
+              "--ramp", "50", "--dump", "--mean-fields"]
+    runs = {}
+    for name, warmup, avg in [("w1", 200, 1), ("w2", 201, 1), ("pair", 200, 2)]:
+        d = tmp_path / name
+        d.mkdir()
+        run_solver(solver_exe, d, *common, "--warmup", warmup, "--avg", avg)
+        runs[name] = d
+    # one-step window: the mean is exactly the snapshot
+    assert np.array_equal(load(runs["w1"], "fields_mean"), load(runs["w1"], "fields"))
+    expected = 0.5 * (load(runs["w1"], "fields") + load(runs["w2"], "fields"))
+    assert np.allclose(load(runs["pair"], "fields_mean"), expected, rtol=0, atol=1e-14)
+    mean, mask = load(runs["pair"], "fields_mean"), load(runs["pair"], "mask")
+    assert mean.shape == (3, 30, 80)
+    assert np.all(mean[:2][:, mask != 0] == 0) and np.all(mean[2][mask != 0] == 1)

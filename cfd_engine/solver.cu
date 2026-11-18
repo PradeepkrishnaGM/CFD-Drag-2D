@@ -5,7 +5,7 @@
  *
  * Usage: solver_cuda --batch cases.csv [global options as for the CPU solver]
  *   cases.csv columns: out_dir,shape,size1,size2,angle,re   (header line required)
- *   All cases share the global options (domain, U, inlet, warmup, avg, guards, --dump).
+ *   All cases share the global options (domain, U, inlet, warmup, avg, guards, --dump, --mean-fields).
  *   Each case writes the same files as the CPU solver into its out_dir; a case rejected
  *   by the guards writes rejected.txt instead.
  *
@@ -37,7 +37,7 @@ constexpr int FORCE_BLOCK = 256;  // threads per block in the force reduction
 __global__ void step_kernel(StepParams base, size_t N, const double* om_p, const double* om_m,
                             const uint8_t* cell, const uint8_t* interior, const double* u_in,
                             const double* A, double* B, double* fnode, int store, double* rho,
-                            double* ux, double* uy) {
+                            double* ux, double* uy, double* mean) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
     const size_t c = blockIdx.z;
     if (x >= base.nx) return;
@@ -48,7 +48,7 @@ __global__ void step_kernel(StepParams base, size_t N, const double* om_p, const
     const uint8_t* in = interior + c * N;
     double fx = 0.0, fy = 0.0;
     node_update(x, y, p, cl, in, u_in, A + c * 9 * N, B + c * 9 * N, fx, fy,
-                store ? rho + c * N : nullptr, ux + c * N, uy + c * N);
+                store ? rho + c * N : nullptr, ux + c * N, uy + c * N, mean ? mean + c * 3 * N : nullptr);
     const size_t k = (size_t)y * base.nx + x;
     if (!in[k]) {
         fnode[2 * (c * N + k)] = fx;
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     std::vector<double> h_A(9 * N);
     std::vector<double> mass0(C);
 
-    double *d_A, *d_B, *d_fnode, *d_rho, *d_ux, *d_uy, *d_uin, *d_omp, *d_omm;
+    double *d_A, *d_B, *d_fnode, *d_rho, *d_ux, *d_uy, *d_uin, *d_omp, *d_omm, *d_mean = nullptr;
     uint8_t *d_cell, *d_interior;
     int *d_fstart, *d_fcount, *d_fidx;
     ForceStats* d_stats;
@@ -180,6 +180,10 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&d_stats, C * sizeof(ForceStats)));
     CK(cudaMemset(d_stats, 0, C * sizeof(ForceStats)));
     CK(cudaMemset(d_fnode, 0, 2 * N * C * sizeof(double)));
+    if (base.mean_fields) {
+        CK(cudaMalloc(&d_mean, 3 * N * C * sizeof(double)));
+        CK(cudaMemset(d_mean, 0, 3 * N * C * sizeof(double)));
+    }
 
     StepParams base_params{};
     for (int c = 0; c < C; ++c) {
@@ -229,7 +233,7 @@ int main(int argc, char** argv) {
         base_params.ramp = c0.box ? 1.0 : ramp_factor(step, c0.ramp);
         const int store = step == total - 1;
         step_kernel<<<grid, block>>>(base_params, N, d_omp, d_omm, d_cell, d_interior, d_uin, d_A, d_B,
-                                     d_fnode, store, d_rho, d_ux, d_uy);
+                                     d_fnode, store, d_rho, d_ux, d_uy, step >= c0.warmup ? d_mean : nullptr);
         force_kernel<<<C, FORCE_BLOCK>>>(N, d_fstart, d_fcount, d_fidx, d_fnode, d_stats, step,
                                          c0.warmup, c0.avg);
         std::swap(d_A, d_B);
@@ -250,12 +254,15 @@ int main(int argc, char** argv) {
     f.rho.resize(N);
     f.ux.resize(N);
     f.uy.resize(N);
+    if (d_mean) f.mean.resize(3 * N);
     int n_diverged = 0;
     for (int c = 0; c < C; ++c) {
         CK(cudaMemcpy(h_A.data(), d_A + c * 9 * N, 9 * N * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(f.rho.data(), d_rho + c * N, N * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(f.ux.data(), d_ux + c * N, N * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(f.uy.data(), d_uy + c * N, N * sizeof(double), cudaMemcpyDeviceToHost));
+        if (d_mean)
+            CK(cudaMemcpy(f.mean.data(), d_mean + c * 3 * N, 3 * N * sizeof(double), cudaMemcpyDeviceToHost));
         // Non-fluid nodes keep the host defaults used by the CPU solver.
         for (size_t k = 0; k < N; ++k)
             if (cases[c].geo.cell[k] != FLUID) { f.rho[k] = 1.0; f.ux[k] = 0.0; f.uy[k] = 0.0; }
@@ -267,7 +274,7 @@ int main(int argc, char** argv) {
 
     for (void* p : {(void*)d_A, (void*)d_B, (void*)d_fnode, (void*)d_rho, (void*)d_ux, (void*)d_uy,
                     (void*)d_uin, (void*)d_omp, (void*)d_omm, (void*)d_cell, (void*)d_interior,
-                    (void*)d_fstart, (void*)d_fcount, (void*)d_fidx, (void*)d_stats})
+                    (void*)d_fstart, (void*)d_fcount, (void*)d_fidx, (void*)d_stats, (void*)d_mean})
         cudaFree(p);
     return 0;
 }

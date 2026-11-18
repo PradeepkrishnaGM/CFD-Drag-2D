@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
     f.rho.assign(g.N, 1.0);
     f.ux.assign(g.N, 0.0);
     f.uy.assign(g.N, 0.0);
+    if (cfg.mean_fields) f.mean.assign(3 * g.N, 0.0);
 
     StepParams p = make_step_params(cfg, g, tau);
     const double mass0 = fluid_mass(g, A.data());
@@ -47,11 +48,12 @@ int main(int argc, char** argv) {
         p.ramp = cfg.box ? 1.0 : ramp_factor(step, cfg.ramp);
         const bool last = step == total - 1;
         double* rho = last ? f.rho.data() : nullptr;
+        double* acc = cfg.mean_fields && step >= cfg.warmup ? f.mean.data() : nullptr;
         double fx = 0.0, fy = 0.0;
         for (int y = 1; y < cfg.ny - 1; ++y)
             for (int x = 0; x < cfg.nx; ++x)
                 node_update(x, y, p, g.cell.data(), g.interior.data(), g.u_in.data(), A.data(),
-                            B.data(), fx, fy, rho, f.ux.data(), f.uy.data());
+                            B.data(), fx, fy, rho, f.ux.data(), f.uy.data(), acc);
         A.swap(B);
         accumulate(stats, step, cfg.warmup, cfg.avg, fx, fy);
         if (step % 500 == 0) {

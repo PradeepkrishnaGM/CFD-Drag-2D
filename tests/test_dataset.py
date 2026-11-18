@@ -1,13 +1,17 @@
 """Sampler invariants, geometry consistency with the solver, and generation determinism."""
+import json
 import math
+import subprocess
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
-from cfd_drag.dataset import crop_mask, generate, load
+from cfd_drag.check import check_fields
+from cfd_drag.dataset import (crop_field, crop_mask, field_window, generate, load, load_fields,
+                              solver_command, window_mask)
 from cfd_drag.geometry import extents
-from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING, DomainParams, PhysicsParams
+from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING, DomainParams, FieldParams
 from cfd_drag.sampling import sample_case
 from solver_run import load as load_npy
 from solver_run import read_results, run_solver
@@ -91,3 +95,32 @@ def test_generation_reports_progress(solver_exe, tmp_path):
     generate(tmp_path, 4, 2, 2, TINY_DOMAIN, TINY_PHYSICS, TINY_SAMPLING, progress=False,
              callback=lambda done, total: calls.append((done, total)))
     assert [c[0] for c in calls] == [1, 2, 3, 4] and all(t == 4 for _, t in calls)
+
+
+TINY_FIELD = FieldParams(width=64, height=38, x_before=16)  # all fluid rows of the tiny channel
+
+
+def test_field_dataset(solver_exe, tmp_path):
+    """Field windows: deterministic, aligned with the masks, no-slip and mass-conserving."""
+    phys = replace(TINY_PHYSICS, warmup_flowthroughs=1.0, avg_flowthroughs=0.5)
+    kw = dict(progress=False, fields=TINY_FIELD)
+    df1 = generate(tmp_path / "w1", 6, 4, 1, TINY_DOMAIN, phys, TINY_SAMPLING, **kw)
+    df2 = generate(tmp_path / "w3", 6, 4, 3, TINY_DOMAIN, phys, TINY_SAMPLING, **kw)
+    f1, f2 = load_fields(tmp_path / "w1"), load_fields(tmp_path / "w3")
+    assert f1.shape == (6, 3, 38, 64) and f1.dtype == np.float16
+    assert np.array_equal(f1, f2) and df1.equals(df2)
+    _, masks = load(tmp_path / "w1", only_ok=False)
+    summary, problems = check_fields(f1, masks, df1, json.loads((tmp_path / "w1" / "config.json").read_text()))
+    assert not problems, (problems, summary)
+    assert summary["max_flux_deviation"] < 0.05
+    # the stored window equals the solver's own mean field for the same case
+    case = sample_case(4, 0, TINY_DOMAIN, phys, TINY_SAMPLING)
+    run = tmp_path / "direct"
+    run.mkdir()
+    subprocess.run(solver_command(case, run, TINY_DOMAIN, phys, mean_fields=True), check=True,
+                   capture_output=True)
+    direct = crop_field(np.load(run / "fields_mean.npy"), TINY_DOMAIN, phys, TINY_FIELD)
+    assert np.array_equal(direct, f1[0])
+    rows, cols = field_window(TINY_DOMAIN, TINY_FIELD)
+    full = (np.load(run / "mask.npy") == 1).astype(np.uint8)
+    assert np.array_equal(window_mask(masks[0], TINY_DOMAIN, TINY_SAMPLING, TINY_FIELD), full[rows, cols])

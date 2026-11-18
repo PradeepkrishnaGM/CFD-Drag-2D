@@ -530,7 +530,7 @@ class LBMSolverGUI(QMainWindow):
         case = Case(0, shape, s1, s2, angle, re, case_info(shape, s1, s2, angle, re).D)
         run_dir = Path(self.run_dir.name)
         error = "crashed" if crashed else ("" if code in (0, 3) else f"exit {code}")
-        row, _ = collect_case(case, run_dir, error, DOMAIN, SAMPLING, None)
+        row, _, _ = collect_case(case, run_dir, error, DOMAIN, SAMPLING, None)
         if (run_dir / "flow_field.ppm").exists():
             with Image.open(run_dir / "flow_field.ppm") as img:
                 rgb = np.ascontiguousarray(img.convert("RGB"))
