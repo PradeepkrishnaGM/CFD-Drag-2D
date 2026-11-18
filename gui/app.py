@@ -13,14 +13,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cfd_drag.dataset import collect_case, generate  # noqa: E402
+from cfd_drag.dataset import collect_case, field_window, generate  # noqa: E402
 from cfd_drag.geometry import vertices  # noqa: E402
-from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING  # noqa: E402
+from cfd_drag.params import DOMAIN, FIELD, PHYSICS, SAMPLING  # noqa: E402
 from cfd_drag.paths import SOLVER_EXE  # noqa: E402
-from cfd_drag.predict import MODEL_PATH, case_info, obstacle_mask, solver_args  # noqa: E402
+from cfd_drag.predict import (FIELD_MODEL_PATH, MODEL_PATH, case_info, obstacle_mask,  # noqa: E402
+                              solver_args, solver_field)
 from cfd_drag.sampling import Case  # noqa: E402
 
 from PyQt6.QtWidgets import (  # noqa: E402
@@ -37,6 +37,38 @@ from PyQt6.QtGui import (  # noqa: E402
 SHAPES = {"Circle": "circle", "Rectangle": "rect", "Triangle": "tri"}
 SCALE = 2.0  # screen pixels per lattice cell
 DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) // 2)  # physical cores, as in generate.py
+
+# Field view: (label, colour range, colormap). Fixed ranges so U-Net and solver views compare 1:1.
+VIEWS = ["Shape preview", "U-Net prediction", "Solver result", "Difference (U-Net - solver)"]
+QUANTITIES = {"Speed |u|/U": ((0.0, 1.8), "viridis"), "ux/U": ((-0.4, 1.8), "viridis"),
+              "uy/U": ((-1.0, 1.0), "RdBu_r"), "Cp": ((-2.5, 2.5), "RdBu_r")}
+DIFF_RANGE = {"Speed |u|/U": 0.3, "ux/U": 0.3, "uy/U": 0.3, "Cp": 0.5}
+
+
+def quantity(field, name):
+    """One scalar map from a (3, H, W) field (ux / U, uy / U, Cp)."""
+    if name == "Speed |u|/U":
+        return np.hypot(field[0], field[1])
+    return field[{"ux/U": 0, "uy/U": 1, "Cp": 2}[name]]
+
+
+def colorize(values, lo, hi, cmap):
+    """float map -> uint8 RGB with a matplotlib colormap (grey if matplotlib is missing)."""
+    t = np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+    try:
+        import matplotlib
+        rgb = matplotlib.colormaps[cmap](t)[..., :3]
+    except ImportError:
+        rgb = np.repeat(t[..., None], 3, axis=2)
+    return (rgb * 255).astype(np.uint8)
+
+
+def field_errors_simple(pred, true, solid):
+    """(velocity, Cp) relative L2 errors on fluid cells."""
+    fl = ~solid
+    du = np.sqrt(((pred[:2, fl] - true[:2, fl]) ** 2).sum() / (true[:2, fl] ** 2).sum())
+    dp = np.sqrt(((pred[2, fl] - true[2, fl]) ** 2).sum() / max((true[2, fl] ** 2).sum(), 1e-12))
+    return float(du), float(dp)
 
 
 # ==========================================
@@ -175,6 +207,9 @@ class LBMSolverGUI(QMainWindow):
         self.run_dir = None
         self.batch_worker = None
         self.cnn_pred = None      # (Cd, Cl) for the current inputs
+        self.unet_field = None    # (3, H, W) U-Net field for the current inputs
+        self.field_solid = None   # (H, W) obstacle cells in the field window
+        self.solver_fields = None  # (3, H, W) mean field of the last solver run (solved_inputs)
         self.solved_inputs = None  # inputs of the last solver run
         self.surrogate, self.surrogate_error = None, ""
         try:
@@ -182,6 +217,12 @@ class LBMSolverGUI(QMainWindow):
             self.surrogate = Surrogate(MODEL_PATH)
         except Exception as e:  # torch missing or no model file: GUI still works without the CNN
             self.surrogate_error = f"{type(e).__name__}: {e}"
+        self.field_surrogate, self.field_error = None, ""
+        try:
+            from cfd_drag.predict import FieldSurrogate
+            self.field_surrogate = FieldSurrogate(FIELD_MODEL_PATH)
+        except Exception as e:  # no U-Net weights (scripts/fetch_field_model.py): no field prediction
+            self.field_error = f"{type(e).__name__}: {e}"
 
         self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
@@ -203,6 +244,17 @@ class LBMSolverGUI(QMainWindow):
         top = QHBoxLayout()
         top.setSpacing(16)
         left = QVBoxLayout()
+        view_row = QHBoxLayout()
+        self.view_combo = QComboBox()
+        self.view_combo.addItems(VIEWS)
+        self.qty_combo = QComboBox()
+        self.qty_combo.addItems(list(QUANTITIES))
+        for label, combo in [("View:", self.view_combo), ("Quantity:", self.qty_combo)]:
+            view_row.addWidget(QLabel(label))
+            view_row.addWidget(combo)
+            combo.currentIndexChanged.connect(lambda *_: self.refresh_canvas())
+        view_row.addStretch(1)
+        left.addLayout(view_row)
         self.canvas = InteractiveGraphicsView()
         self.canvas.setMinimumSize(820, 230)
         left.addWidget(self.canvas, stretch=1)
@@ -391,6 +443,7 @@ class LBMSolverGUI(QMainWindow):
 
         mask = None
         self.cnn_pred = None
+        self.unet_field = None
         if info.blockage <= PHYSICS.max_blockage and Path(self.executable).exists():
             try:
                 t = time.perf_counter()
@@ -400,6 +453,11 @@ class LBMSolverGUI(QMainWindow):
                     t = time.perf_counter()
                     self.cnn_pred = self.surrogate.predict(mask, re)
                     t_cnn = time.perf_counter() - t
+                if self.field_surrogate is not None:
+                    t = time.perf_counter()
+                    self.unet_field = self.field_surrogate.predict(mask, re)
+                    self.field_solid = self.field_surrogate.window_mask(mask).astype(bool)
+                    t_unet = time.perf_counter() - t
             except Exception as e:
                 self.cnn_time.setText(f"mask error: {e}"[:80])
         self.show_mask(mask)
@@ -408,7 +466,8 @@ class LBMSolverGUI(QMainWindow):
             self.cnn_cd.setText(f"C<sub>d</sub> = {cd:.3f}")
             self.cnn_cl.setText(f"C<sub>l</sub> = {cl:+.3f}")
             note = " · outside training range" if info.warnings else ""
-            self.cnn_time.setText(f"{t_cnn * 1000:.0f} ms (+{t_mask * 1000:.0f} ms mask){note}")
+            unet = f" · U-Net field {t_unet * 1000:.0f} ms" if self.unet_field is not None else ""
+            self.cnn_time.setText(f"{t_cnn * 1000:.0f} ms (+{t_mask * 1000:.0f} ms mask){unet}{note}")
         else:
             self.cnn_cd.setText("C<sub>d</sub> --")
             self.cnn_cl.setText("C<sub>l</sub> --")
@@ -420,10 +479,54 @@ class LBMSolverGUI(QMainWindow):
 
         if self.solved_inputs is not None and self.solved_inputs == self.inputs():
             self.update_comparison()
-            return  # keep showing the flow field for these inputs
-        if not self.is_busy():
+        elif not self.is_busy():
             self.clear_solver_panel()
+        self.refresh_canvas()
+
+    # ---------- canvas: shape preview or flow fields ----------
+    def refresh_canvas(self):
+        view, qty = self.view_combo.currentText(), self.qty_combo.currentText()
+        shape, s1, s2, angle, re = self.inputs()
+        solved = self.solver_fields if self.solved_inputs == self.inputs() else None
+        unet = self.unet_field
+        if view == VIEWS[1] and unet is not None:
+            self.show_field(quantity(unet, qty), *QUANTITIES[qty], f"U-Net prediction (time-averaged {qty}), "
+                            f"{shape}, Re = {re:g}")
+        elif view == VIEWS[2] and solved is not None:
+            self.show_field(quantity(solved, qty), *QUANTITIES[qty], f"LBM solver (time-averaged {qty}), "
+                            f"{shape}, Re = {re:g}")
+        elif view == VIEWS[3] and solved is not None and unet is not None:
+            d = DIFF_RANGE[qty]
+            self.show_field(quantity(unet, qty) - quantity(solved, qty), (-d, d), "RdBu_r",
+                            f"U-Net minus solver ({qty}), {shape}, Re = {re:g}")
+        else:
             self.draw_preview(shape, s1, s2, angle)
+            if view == VIEWS[1]:
+                reason = ("U-Net weights missing: python scripts/fetch_field_model.py"
+                          if self.field_surrogate is None else "no prediction for this shape")
+                self.canvas_caption.setText(f"{reason}. Showing the shape preview.")
+            elif view != VIEWS[0]:
+                self.canvas_caption.setText("Press RUN SOLVER to compute the solver field. Showing the shape preview.")
+
+    def show_field(self, values, rng, cmap, caption):
+        """Draw a field-window map into the channel picture (obstacle in black)."""
+        rows, cols = field_window(DOMAIN, FIELD)
+        img = np.zeros((DOMAIN.ny, DOMAIN.nx, 3), np.uint8)
+        img[:] = (30, 30, 46)
+        img[[0, -1]] = (137, 180, 250)  # channel walls
+        rgb = colorize(values, rng[0], rng[1], cmap)
+        if self.field_solid is not None:
+            rgb[self.field_solid] = (17, 17, 27)
+        img[rows, cols] = rgb
+        img = np.ascontiguousarray(np.flipud(img))  # lattice y points up
+        qimg = QImage(img.data, img.shape[1], img.shape[0], 3 * img.shape[1], QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg.copy()).scaled(int(DOMAIN.nx * SCALE), int(DOMAIN.ny * SCALE),
+                                                     Qt.AspectRatioMode.IgnoreAspectRatio,
+                                                     Qt.TransformationMode.SmoothTransformation)
+        self.canvas.reset_view()
+        self.canvas.setPixmap(pix)
+        self.canvas_caption.setText(f"{caption}. Colour range {rng[0]:g} to {rng[1]:g}; "
+                                    f"window {FIELD.width} x {FIELD.height} cells. Scroll to zoom, drag to pan.")
 
     def show_mask(self, mask):
         if mask is None:
@@ -505,7 +608,7 @@ class LBMSolverGUI(QMainWindow):
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.finished.connect(self.simulation_finished)
         self.process.start(self.executable, ["--out-dir", self.run_dir.name,
-                                             *solver_args(shape, s1, s2, angle, re)])
+                                             *solver_args(shape, s1, s2, angle, re, mean_fields=True)])
 
     def handle_stdout(self):
         out = self.process.readAllStandardOutput().data().decode(errors="replace")
@@ -531,22 +634,14 @@ class LBMSolverGUI(QMainWindow):
         run_dir = Path(self.run_dir.name)
         error = "crashed" if crashed else ("" if code in (0, 3) else f"exit {code}")
         row, _, _ = collect_case(case, run_dir, error, DOMAIN, SAMPLING, None)
-        if (run_dir / "flow_field.ppm").exists():
-            with Image.open(run_dir / "flow_field.ppm") as img:
-                rgb = np.ascontiguousarray(img.convert("RGB"))
-            qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QImage.Format.Format_RGB888)
-            pix = QPixmap.fromImage(qimg.copy()).scaled(int(DOMAIN.nx * SCALE), int(DOMAIN.ny * SCALE),
-                                                         Qt.AspectRatioMode.IgnoreAspectRatio,
-                                                         Qt.TransformationMode.SmoothTransformation)
-            self.canvas.reset_view()
-            self.canvas.setPixmap(pix)
-            self.canvas_caption.setText(f"Velocity magnitude (time step at the end of averaging), "
-                                        f"{shape}, Re = {re:g}. Scroll to zoom, drag to pan.")
+        self.solver_fields = solver_field(run_dir) if row["ok"] and (run_dir / "fields_mean.npy").exists() else None
         self.run_dir.cleanup()
         self.run_dir = None
         self.last_row = row
         if row["ok"]:
             self.solved_inputs = self.run_inputs
+            if self.view_combo.currentText() == VIEWS[0]:
+                self.view_combo.setCurrentText(VIEWS[2])
             self.sol_cd.setText(f"C<sub>d</sub> = {row['Cd']:.3f}")
             self.sol_cl.setText(f"C<sub>l</sub> = {row['Cl']:+.3f}")
             regime = "vortex shedding" if row["status"] == "periodic" else "steady"
@@ -564,7 +659,11 @@ class LBMSolverGUI(QMainWindow):
             return
         cd, cl = self.cnn_pred
         err = abs(cd - row["Cd"]) / abs(row["Cd"])
-        self.sol_err.setText(f"CNN error: C<sub>d</sub> {err:.1%} · C<sub>l</sub> {abs(cl - row['Cl']):.3f} (abs)")
+        text = f"CNN error: C<sub>d</sub> {err:.1%} · C<sub>l</sub> {abs(cl - row['Cl']):.3f} (abs)"
+        if self.unet_field is not None and self.solver_fields is not None:
+            du, dp = field_errors_simple(self.unet_field, self.solver_fields, self.field_solid)
+            text += f"<br>U-Net field error: velocity {du:.1%} · C<sub>p</sub> {dp:.1%}"
+        self.sol_err.setText(text)
 
     # ---------- dataset generation ----------
     def run_batch_mode(self):
@@ -695,8 +794,8 @@ class LBMSolverGUI(QMainWindow):
         """)
 
 
-def take_screenshot(window, path, inputs=("Rectangle", 8.0, 16.0, 30.0, 60.0)):
-    """Run one demo case with the solver, then save a screenshot of the window and quit."""
+def take_screenshot(window, path, inputs=("Rectangle", 8.0, 16.0, 30.0, 60.0), view=None):
+    """Run one demo case with the solver, then save a screenshot of the window (in `view`) and quit."""
     shape, s1, s2, angle, re = inputs
     window.shape_combo.setCurrentText(shape)
     window.size1_spin.setValue(s1)
@@ -708,6 +807,8 @@ def take_screenshot(window, path, inputs=("Rectangle", 8.0, 16.0, 30.0, 60.0)):
 
     def poll():
         if window.process is None:
+            if view:
+                window.view_combo.setCurrentText(view)
             QApplication.processEvents()
             window.grab().save(str(path))
             print(f"saved {path}")
@@ -722,7 +823,8 @@ def main():
     window = LBMSolverGUI()
     window.show()
     if "--screenshot" in sys.argv:
-        take_screenshot(window, Path(sys.argv[sys.argv.index("--screenshot") + 1]))
+        view = sys.argv[sys.argv.index("--view") + 1] if "--view" in sys.argv else None
+        take_screenshot(window, Path(sys.argv[sys.argv.index("--screenshot") + 1]), view=view)
     sys.exit(app.exec())
 
 

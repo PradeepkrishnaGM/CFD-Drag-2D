@@ -13,3 +13,7 @@ flow_field.png
 
 # Training runs (M5)
 runs/
+
+# U-Net weights are a release asset (scripts/fetch_field_model.py)
+models/field_unet_v1.pt
+models/*.part

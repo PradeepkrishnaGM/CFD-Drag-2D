@@ -10,12 +10,14 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import crop_mask, global_args
+from .dataset import crop_field, crop_mask, global_args, window_mask
 from .geometry import extents
-from .params import DOMAIN, PHYSICS, SAMPLING, DomainParams, PhysicsParams, SamplingParams
+from .params import FIELD, DOMAIN, PHYSICS, SAMPLING, DomainParams, PhysicsParams, SamplingParams
 from .paths import REPO_ROOT, SOLVER_EXE
 
 MODEL_PATH = REPO_ROOT / "models" / "surrogate_v1.pt"
+# U-Net weights (31 MB) are a release asset, not tracked in git: scripts/fetch_field_model.py
+FIELD_MODEL_PATH = REPO_ROOT / "models" / "field_unet_v1.pt"
 
 
 @dataclass
@@ -56,11 +58,12 @@ def case_info(shape: str, size1: float, size2: float, angle: float, re: float,
 
 
 def solver_args(shape: str, size1: float, size2: float, angle: float, re: float,
-                domain: DomainParams = DOMAIN, physics: PhysicsParams = PHYSICS) -> list[str]:
+                domain: DomainParams = DOMAIN, physics: PhysicsParams = PHYSICS,
+                mean_fields: bool = False) -> list[str]:
     """Solver arguments with the dataset settings (without --out-dir)."""
     if shape == "circle":
         size2, angle = size1, 0.0
-    return [*global_args(domain, physics), "--shape", shape, "--size1", repr(float(size1)),
+    return [*global_args(domain, physics, mean_fields), "--shape", shape, "--size1", repr(float(size1)),
             "--size2", repr(float(size2)), "--angle", repr(float(angle)), "--re", repr(float(re))]
 
 
@@ -106,3 +109,28 @@ class Surrogate:
             y = self.model(x, r).numpy()
         cd, cl = self.norm.y_inverse(y)[0]
         return float(cd), float(cl)
+
+
+def solver_field(run_dir: Path, domain: DomainParams = DOMAIN, physics: PhysicsParams = PHYSICS) -> np.ndarray:
+    """The field window (ux / U, uy / U, Cp) of a solver run made with mean_fields=True."""
+    return crop_field(np.load(Path(run_dir) / "fields_mean.npy"), domain, physics, FIELD).astype(np.float32)
+
+
+class FieldSurrogate:
+    """The trained U-Net on the CPU: predict(mask, re) -> (3, H, W) time-averaged (ux / U, uy / U, Cp)
+    in the field window; `mask` is the 64 x 64 crop from obstacle_mask()."""
+
+    def __init__(self, path: Path = FIELD_MODEL_PATH):
+        import torch  # optional dependency
+
+        from .surrogate.field_train import load_field_model
+        torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
+        self.model, self.norm, self.params, self.ckpt = load_field_model(Path(path), "cpu")
+
+    def window_mask(self, mask: np.ndarray) -> np.ndarray:
+        return window_mask(mask, DOMAIN, SAMPLING, FIELD)
+
+    def predict(self, mask: np.ndarray, re: float) -> np.ndarray:
+        from .surrogate.field_train import predict_fields
+        return predict_fields(self.model, self.norm, self.params, self.window_mask(mask)[None],
+                              np.array([re], float))[0]
