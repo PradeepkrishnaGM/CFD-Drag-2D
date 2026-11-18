@@ -34,3 +34,5 @@
 | 2026-11-18 | Kaggle notebooks clone the public repo and build with the image's nvcc; scripts/kaggle_setup_cuda.sh falls back to NVIDIA's redistributable | No GPU or CUDA toolkit on the dev machine |
 | 2026-11-18 | M4 dataset: N = 5000 cases, seed 0, CUDA back-end on Kaggle 2x T4, no velocity images | ~1 h of GPU; images are visualisation only and large |
 | 2026-11-18 | Kaggle dataset private until M6; dataset check fails below 95 % ok cases | Owner approval |
+| 2026-11-18 | Dataset check (cfd_drag/check.py) plus a CPU spot check of 8 random cases run inside the generation notebook | Catches broken data before training; proves GPU results are reproducible from the code |
+| 2026-11-18 | Dataset v1: 5000 cases from commit 96556fb, 100 % ok, spot check max rel diff 4e-10; 59 min on 2x T4 (0.70 s/case) | Kaggle run 2026-11-18; private Kaggle dataset doffice2026/cfd-drag-2d-lbm |

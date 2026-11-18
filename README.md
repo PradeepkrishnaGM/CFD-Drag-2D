@@ -25,8 +25,8 @@ Designed as a complete aerodynamic "data factory," the project features a custom
   Schäfer–Turek 2D-1 cylinder benchmark (Cd = 5.58 at Re = 20).
 
 ## Status
-Work in progress. Planned next:
-large-scale dataset generation, and a CNN surrogate that predicts drag from geometry.
+Work in progress. Done: validated solver, CPU and CUDA dataset pipeline, a 5000-case dataset.
+Planned next: a CNN surrogate that predicts drag from geometry, then the GUI update.
 See `SPEC.md` for the full plan and `DECISIONS.md` for design choices.
 
 ## Prerequisites
@@ -57,6 +57,9 @@ make test
 # 6. GPU generation (needs nvcc): build, then use the cuda back-end
 make cuda
 python scripts/generate.py --n 1000 --seed 0 --backend cuda --out dataset
+
+# 7. Check a dataset (writes summary.json; exits 1 if a check fails)
+python scripts/check_dataset.py --data dataset
 ```
 
 All tunable defaults (domain size, steps, sampling ranges) live in `cfd_drag/params.py`.
@@ -70,3 +73,20 @@ A dataset directory contains:
 Load it with `cfd_drag.dataset.load("dataset")`. `example_data/` holds 24 cases.
 
 Throughput: about 6.75 s per case on the development machine (i5-10500T, 6 workers) and 1.4 s per case per Tesla T4 on Kaggle. `notebooks/m3_cuda_check.ipynb` verifies the GPU solver on Kaggle.
+
+## Dataset
+`notebooks/m4_generate_dataset.ipynb` generates the full dataset on a Kaggle GPU notebook (2x Tesla T4):
+it clones the repository at a fixed commit, runs the tests, solves 5000 cases (seed 0) with the CUDA
+solver, re-solves 8 random cases on the CPU as a reproducibility check, and runs `check_dataset.py`.
+
+| | |
+|---|---|
+| Cases | 5000, all solved cleanly (1671 circles, 1645 rectangles, 1684 triangles) |
+| Flow regime | 2757 steady, 2243 vortex shedding |
+| Re / frontal height D | 20 to 100 (median 54) / 5 to 24.5 cells |
+| Cd (min / median / max) | 0.82 / 2.16 / 5.37 |
+| GPU vs CPU re-runs | max relative difference 4e-10 |
+| Generation time | 59 min on 2x T4 (0.70 s per case) |
+| Size | 21 MB (`data.csv`, `masks.npy`, config and check files) |
+
+The dataset is a private Kaggle dataset for now (link to follow when it is made public).
