@@ -84,3 +84,10 @@ def test_load_returns_aligned_ok_rows(solver_exe, tmp_path):
     assert masks.shape[1:] == (32, 32) and masks.dtype == np.uint8
     assert all(m.sum() > 0 for m in masks)
     assert len(list((out / "images").glob("*.png"))) == 4
+
+
+def test_generation_reports_progress(solver_exe, tmp_path):
+    calls = []
+    generate(tmp_path, 4, 2, 2, TINY_DOMAIN, TINY_PHYSICS, TINY_SAMPLING, progress=False,
+             callback=lambda done, total: calls.append((done, total)))
+    assert [c[0] for c in calls] == [1, 2, 3, 4] and all(t == 4 for _, t in calls)

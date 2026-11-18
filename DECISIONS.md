@@ -41,3 +41,8 @@
 | 2026-11-18 | ML dependencies (torch, scikit-learn, matplotlib) as optional extra `[ml]`; checkpoints stay out of git until M6 | Keeps the solver/dataset install light |
 | 2026-11-18 | Training seed is a CLI option (`--seed`, default 0); the split seed stays fixed | Seed spread measured on the same test set |
 | 2026-11-18 | Surrogate v1 (commits 38ce07f / 38db73e, Kaggle T4): CNN test Cd MAE 0.051 ± 0.002, Cd rel 2.3 ± 0.1 %, Cl MAE 0.060 ± 0.007 (3 seeds) vs gradient boosting 0.073 / 3.4 % / 0.101 -> passes | Owner reviewed; README reports mean ± std and the limits |
+| 2026-11-18 | M6 run without per-step approval | Owner: "go full speed and non stop and complete the project" |
+| 2026-11-18 | GUI builds the CNN input with a one-step solver run (--warmup 1 --avg 1 --dump), ~20 ms | Exactly the training mask; no second rasteriser to keep in sync |
+| 2026-11-18 | Trained surrogate committed as models/surrogate_v1.pt (1 MB, seed 0) | GUI works right after cloning; small enough for git |
+| 2026-11-18 | GUI inputs are shape, sizes, angle and Re (inlet velocity and legacy --steps removed); invalid cases disable RUN SOLVER, out-of-range cases get a warning but still a CNN prediction | Same settings as the dataset, so CNN and solver are comparable |
+| 2026-11-18 | GUI dataset mode calls cfd_drag.dataset.generate (progress callback added); old GUI batch code removed | One pipeline, same seeds and checks as the CLI |

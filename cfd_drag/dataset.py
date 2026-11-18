@@ -22,6 +22,7 @@ import os
 import queue
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -178,10 +179,11 @@ def _config(seed: int, backend: str, domain, physics, sampling) -> dict:
 def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
              physics: PhysicsParams, sampling: SamplingParams, images: bool = False,
              progress: bool = True, backend: str = "cpu", gpu: GpuParams = GpuParams(),
-             gpus: int | None = None) -> pd.DataFrame:
+             gpus: int | None = None, callback=None) -> pd.DataFrame:
     """Generate cases 0..n-1 (skipping ones already on disk) and consolidate.
 
     `workers` applies to the cpu back-end; `gpus` (default: all visible) to cuda.
+    `callback(done, total)` is called after each finished case (cpu) or batch (cuda).
     """
     exe = {"cpu": SOLVER_EXE, "cuda": SOLVER_CUDA_EXE}[backend]
     if not exe.exists():
@@ -201,12 +203,21 @@ def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
 
     todo = [i for i in range(n) if not _sample_path(out, i).exists()]
     bar = tqdm(total=len(todo), desc=f"Simulating ({backend})", disable=not progress)
+    done, lock = 0, threading.Lock()  # cuda batches finish on several threads
+
+    def advance(k):
+        nonlocal done
+        with lock:
+            done += k
+            bar.update(k)
+            if callback:
+                callback(done, len(todo))
     if backend == "cpu" and todo:
         jobs = [(i, seed, out, domain, physics, sampling, images) for i in todo]
         ctx = multiprocessing.get_context("spawn")  # fork is unsafe in threaded parents
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
             for _ in pool.map(_cpu_worker, jobs, chunksize=1):
-                bar.update(1)
+                advance(1)
     elif backend == "cuda" and todo:
         n_gpus = gpus or count_gpus()
         free = queue.Queue()
@@ -223,7 +234,7 @@ def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
                 free.put(device)
             for c, (row, mask) in zip(cases, results):
                 _save(out, c.index, row, mask)
-            bar.update(len(indices))
+            advance(len(indices))
 
         chunks = [todo[i:i + gpu.batch_size] for i in range(0, len(todo), gpu.batch_size)]
         with ThreadPoolExecutor(max_workers=n_gpus) as pool:

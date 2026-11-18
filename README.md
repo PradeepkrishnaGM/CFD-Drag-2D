@@ -1,18 +1,37 @@
-# CFD-Drag-2D: Aerodynamic Dataset Generator & Flow Studio
+# CFD-Drag-2D: Lattice Boltzmann Solver, Drag Dataset and CNN Surrogate
 
-![C++](https://img.shields.io/badge/C++-17-blue) ![CUDA](https://img.shields.io/badge/CUDA-batch%20solver-green) ![Python](https://img.shields.io/badge/Python-3.8+-yellow) ![License](https://img.shields.io/badge/License-MIT-green)
+![C++](https://img.shields.io/badge/C++-17-blue) ![CUDA](https://img.shields.io/badge/CUDA-batch%20solver-green) ![Python](https://img.shields.io/badge/Python-3.10+-yellow) ![PyTorch](https://img.shields.io/badge/PyTorch-CNN-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Overview
-This repository contains a high-performance 2D Computational Fluid Dynamics (CFD) solver based on the D2Q9 Lattice Boltzmann Method (LBM), implemented from scratch in C++ and CUDA. 
+A complete, reproducible pipeline from physics to machine learning:
 
-Designed as a complete aerodynamic "data factory," the project features a custom interactive GUI for real-time flow visualization and a Python automation pipeline. It is purpose-built to rapidly generate large-scale, geometry-aware fluid flow datasets and compute precise aerodynamic metrics (Drag Coefficient, Pressure Loss) for machine learning and surrogate model training.
+1. **Solver:** a 2D lattice Boltzmann (D2Q9, TRT) flow solver written from scratch in C++ and CUDA,
+   validated against the Schäfer–Turek cylinder benchmark.
+2. **Dataset:** 5000 random obstacles (circles, rectangles, triangles at any angle, Re 20 to 100)
+   solved on two Kaggle T4 GPUs in under an hour, with automatic quality checks.
+3. **Surrogate:** a small CNN that predicts drag (Cd) and lift (Cl) from the obstacle shape and Re
+   in milliseconds, with a 2.3 % mean Cd error, beating a gradient-boosting baseline that is
+   given the exact shape parameters.
+4. **Flow Studio:** a desktop app to design an obstacle, see the CNN prediction instantly, and
+   check it against the full simulation.
+
+![Flow Studio](docs/gui.png)
+
+*Flow Studio: the CNN predicts Cd = 2.31 in 2 ms; the solver gives 2.39 after 42 s (3.3 % error).
+Vortex shedding behind a rectangle at Re = 60.*
 
 ## Features
-* **CPU and CUDA engines:** Both share one per-node update (`cfd_engine/lbm_common.hpp`). The CUDA solver simulates hundreds of cases per launch and matches the CPU solver to 10 digits.
-* **Interactive GUI Studio:** A responsive, dark-themed PyQt6 desktop application to manually design obstacles, tune physics parameters, and visualize flow fields instantly.
-* **Custom Geometry Handling:** Simulates fluid interaction around circles, rectangles, and triangles with dynamic sizes and variable Angles of Attack (AoA).
-* **Native Physics Calculation:** Accurately calculates the Drag Coefficient ($C_d$) via the Momentum Exchange Method directly inside the C++ simulation loop.
-* **Batch Automation:** `scripts/generate.py` samples valid cases from a seed, runs them in parallel, resumes interrupted runs, and stores obstacle masks with their aerodynamic targets.
+* **CPU and CUDA engines:** both share one per-node update (`cfd_engine/lbm_common.hpp`). The CUDA
+  solver runs hundreds of cases per launch and matches the CPU solver to 10 digits.
+* **Correct physics inputs:** Reynolds number as input, time-averaged Cd/Cl after warm-up (vortex
+  shedding), projected frontal height as reference length, stability and blockage guards.
+* **Reproducible dataset pipeline:** seeded per-case sampling, parallel and resumable generation,
+  identical results for any worker count or GPU batch size, dataset checks and a CPU spot check.
+* **CNN surrogate:** PyTorch, trained on Kaggle GPUs from a notebook that clones this repository;
+  evaluated against mean and gradient-boosting baselines over 3 training seeds.
+* **Flow Studio (PyQt6):** live CNN prediction with input validation, full solver run with flow
+  field, and dataset generation from the GUI.
+* **Tested:** 49 tests, including physics validation, determinism and GPU-vs-CPU agreement.
 
 ## Solver
 * D2Q9 lattice Boltzmann with TRT collision, half-way bounce-back walls, Zou-He velocity inlet
@@ -25,9 +44,8 @@ Designed as a complete aerodynamic "data factory," the project features a custom
   Schäfer–Turek 2D-1 cylinder benchmark (Cd = 5.58 at Re = 20).
 
 ## Status
-Work in progress. Done: validated solver, CPU and CUDA dataset pipeline, a 5000-case dataset,
-a CNN surrogate that predicts Cd and Cl from geometry. Planned next: the GUI update.
-See `SPEC.md` for the full plan and `DECISIONS.md` for design choices.
+Complete (milestones M0 to M6). See `SPEC.md` for the specification and `DECISIONS.md` for every
+design choice and result.
 
 ## Prerequisites
 * **C++ Compiler:** GCC/G++ with C++17 support, and `make`.
@@ -44,7 +62,7 @@ make solver
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -e .
 
-# 3. Interactive Flow Studio (GUI)
+# 3. Flow Studio (GUI); the CNN panel needs the [ml] extra (step 8)
 python gui/app.py
 
 # 4. CLI dataset generation (resumable; writes to ./dataset by default)
@@ -122,3 +140,32 @@ Limits:
   values), three shape families and Re 20 to 100. Other shapes or flow conditions are untested.
 - Cl of circles (true value about 0): CNN MAE 0.018 against 0.005 for gradient boosting, which is
   told the shape is a circle; a pixelated circle is not perfectly symmetric.
+
+## Flow Studio
+`python gui/app.py`
+* **Geometry and flow:** shape, sizes and angle in lattice cells, and the Reynolds number. The
+  panel shows the frontal height D, blockage and relaxation time τ, and flags inputs the solver
+  rejects (unstable τ, blockage above 25 %) or that lie outside the CNN's training range.
+* **CNN prediction (instant):** on every change the app builds the exact 64x64 mask the CNN was
+  trained on (one solver step, ~20 ms) and predicts Cd and Cl with `models/surrogate_v1.pt`.
+* **Run solver:** the full simulation with the dataset settings (about 40 s on a 6-core desktop CPU), the
+  velocity field, Cd, Cl, Cl_rms, flow regime and the CNN's error against the solver.
+* **Generate dataset:** the same pipeline as `scripts/generate.py` (seed, size, workers, shapes),
+  resumable by choosing the same folder again.
+* `python gui/app.py --screenshot docs/gui.png` runs a demo case and saves the screenshot above.
+
+![Parity plot](docs/parity.png)
+
+*CNN vs solver on the 750 held-out test cases (training seed 0).*
+
+## Project layout
+```
+cfd_engine/      C++ and CUDA lattice Boltzmann solvers (shared per-node update)
+cfd_drag/        Python package: params, geometry, sampling, dataset pipeline, checks,
+                 surrogate (data, model, training, metrics), single-case prediction
+scripts/         generate.py, check_dataset.py, train.py, evaluate.py, compare_backends.py
+notebooks/       Kaggle notebooks: CUDA check (M3), dataset generation (M4), training (M5)
+gui/app.py       Flow Studio
+models/          trained surrogate (1 MB)
+tests/           pytest suite (`make test` quick, `make test-all` with slow physics validation)
+```

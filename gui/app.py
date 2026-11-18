@@ -1,146 +1,67 @@
-import sys
-import os
-import csv
+"""LBM Flow Studio: design an obstacle, get an instant CNN prediction, verify it with the solver.
+
+Run:  python gui/app.py
+      python gui/app.py --screenshot docs/gui.png   (runs a demo case, saves a screenshot, exits)
+"""
+import html
 import math
-import random
-import subprocess
+import os
+import sys
+import tempfile
+import time
+from dataclasses import replace
 from pathlib import Path
+
+import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from cfd_drag.dataset import collect_case, generate  # noqa: E402
+from cfd_drag.geometry import vertices  # noqa: E402
+from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING  # noqa: E402
 from cfd_drag.paths import SOLVER_EXE  # noqa: E402
+from cfd_drag.predict import MODEL_PATH, case_info, obstacle_mask, solver_args  # noqa: E402
+from cfd_drag.sampling import Case  # noqa: E402
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QGridLayout, QLabel, QPushButton, QComboBox, QSlider, QDoubleSpinBox, 
-    QGroupBox, QProgressBar, QStatusBar, QMenuBar, QFileDialog, 
-    QInputDialog, QMessageBox, QRadioButton, QSpinBox, QCheckBox,
+from PyQt6.QtWidgets import (  # noqa: E402
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QPushButton, QComboBox, QDoubleSpinBox,
+    QGroupBox, QFileDialog, QMessageBox, QRadioButton, QSpinBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
-from PyQt6.QtCore import Qt, QProcess, QThread, pyqtSignal, QRectF, QPointF
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QAction, QPolygonF, QCursor, QWheelEvent
+from PyQt6.QtCore import Qt, QProcess, QThread, QTimer, pyqtSignal, QRectF, QPointF  # noqa: E402
+from PyQt6.QtGui import (  # noqa: E402
+    QPixmap, QPainter, QColor, QPen, QBrush, QPolygonF, QCursor, QWheelEvent, QImage
+)
+
+SHAPES = {"Circle": "circle", "Rectangle": "rect", "Triangle": "tri"}
+SCALE = 2.0  # screen pixels per lattice cell
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) // 2)  # physical cores, as in generate.py
+
 
 # ==========================================
-# Worker Thread for Batch Automation
+# Worker thread for dataset generation
 # ==========================================
 class BatchWorker(QThread):
-    progress = pyqtSignal(int, int) # current, total
-    finished = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # done, total
+    finished_ok = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, executable, output_dir, num_samples, tuning_params):
+    def __init__(self, out_dir, n, seed, workers, shapes, images):
         super().__init__()
-        self.executable = executable
-        self.output_dir = Path(output_dir)
-        self.num_samples = num_samples
-        self.tuning = tuning_params
-        self.is_running = True
-
-    def generate_random_params(self, allowed_shapes, ny):
-        """Replicates logic directly from the provided python automation script."""
-        shape = random.choice(allowed_shapes)
-        
-        max_size = ny * 0.35 
-        min_size = ny * 0.05
-        
-        size1 = random.uniform(min_size, max_size)
-        
-        if shape == "circle":
-            size2 = size1
-        else:
-            size2 = random.uniform(min_size, max_size)
-            
-        angle = random.uniform(self.tuning['ang_min'], self.tuning['ang_max'])
-        velocity = random.uniform(self.tuning['vel_min'], self.tuning['vel_max'])
-        
-        return {
-            "shape": shape,
-            "size1": round(size1, 3),
-            "size2": round(size2, 3),
-            "angle": round(angle, 2),
-            "velocity": round(velocity, 4)
-        }
+        self.out_dir, self.n, self.seed, self.workers = Path(out_dir), n, seed, workers
+        self.shapes, self.images = tuple(shapes), images
 
     def run(self):
-        nx, ny = 400, 100
-        images_dir = self.output_dir / "images"
-        master_csv = self.output_dir / "training_data.csv"
-
         try:
-            images_dir.mkdir(parents=True, exist_ok=True)
-            if not master_csv.exists():
-                with open(master_csv, mode='w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        "sample_id", "shape", "size1", "size2", 
-                        "angle", "velocity", "Cd", "pressure_loss", "image_path"
-                    ])
-
-            successful_samples = 0
-            while successful_samples < self.num_samples and self.is_running:
-                # 1. Generate Parameters
-                params = self.generate_random_params(self.tuning['shapes'], ny)
-
-                # 2. Cleanup & Run
-                for temp_file in ["results.csv", "flow_field.ppm"]:
-                    if os.path.exists(temp_file): os.remove(temp_file)
-
-                cmd = [
-                    self.executable, "--width", str(nx), "--height", str(ny),
-                    "--shape", params["shape"], "--size1", str(params["size1"]),
-                    "--size2", str(params["size2"]), "--angle", str(params["angle"]),
-                    "--velocity", str(params["velocity"]), "--steps", "15000"
-                ]
-
-                try:
-                    subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
-                except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-                    continue
-
-                if not os.path.exists("results.csv") or not os.path.exists("flow_field.ppm"):
-                    continue
-
-                # 3. Parse CSV
-                try:
-                    with open("results.csv", mode='r') as f:
-                        reader = csv.DictReader(f)
-                        row = next(reader)
-                    Cd = float(row["Cd"])
-                    dP = float(row["pressure_loss"])
-                    if math.isnan(Cd) or math.isinf(Cd) or math.isnan(dP) or math.isinf(dP) or abs(Cd) > 100.0:
-                        continue
-                except Exception:
-                    continue
-
-                # 4. Process Image
-                sample_id = f"{successful_samples:05d}"
-                img_name = f"sample_{sample_id}.png"
-                img_path = images_dir / img_name
-                try:
-                    with Image.open("flow_field.ppm") as img:
-                        img.save(img_path, format="PNG")
-                except Exception:
-                    continue
-
-                # 5. Save Record
-                with open(master_csv, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        sample_id, params["shape"], params["size1"], params["size2"],
-                        params["angle"], params["velocity"], Cd, dP, str(img_path.as_posix())
-                    ])
-
-                successful_samples += 1
-                self.progress.emit(successful_samples, self.num_samples)
-
-            if self.is_running:
-                self.finished.emit(f"Successfully generated {successful_samples} samples.")
-                
-        except Exception as e:
+            df = generate(self.out_dir, self.n, self.seed, self.workers, DOMAIN, PHYSICS,
+                          replace(SAMPLING, shapes=self.shapes), images=self.images, progress=False,
+                          callback=lambda done, total: self.progress.emit(done, total))
+            self.finished_ok.emit(f"{int(df['ok'].sum())} of {len(df)} cases solved.\n"
+                                  f"Saved data.csv and masks.npy in {self.out_dir}")
+        except Exception as e:  # shown to the user
             self.error.emit(str(e))
 
-    def stop(self):
-        self.is_running = False
 
 # ==========================================
 # Custom Circular Progress Widget
@@ -241,414 +162,446 @@ class InteractiveGraphicsView(QGraphicsView):
         self.scale(zoom_factor, zoom_factor)
 
 # ==========================================
+# ==========================================
 # Main GUI Application
 # ==========================================
 class LBMSolverGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LBM Flow Studio - Advanced Dataset Generator")
-        self.resize(1200, 650)
-        
-        # Domain configuration
-        self.domain_nx = 400
-        self.domain_ny = 100
+        self.setWindowTitle("LBM Flow Studio: CFD solver + CNN surrogate")
+        self.resize(1280, 760)
         self.executable = str(SOLVER_EXE)
-        
         self.process = None
+        self.run_dir = None
         self.batch_worker = None
-        
+        self.cnn_pred = None      # (Cd, Cl) for the current inputs
+        self.solved_inputs = None  # inputs of the last solver run
+        self.surrogate, self.surrogate_error = None, ""
+        try:
+            from cfd_drag.predict import Surrogate
+            self.surrogate = Surrogate(MODEL_PATH)
+        except Exception as e:  # torch missing or no model file: GUI still works without the CNN
+            self.surrogate_error = f"{type(e).__name__}: {e}"
+
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(150)
+        self.update_timer.timeout.connect(self.update_case)
+
         self.init_ui()
         self.apply_dark_theme()
-        self.update_preview()
+        self.update_case()
 
+    # ---------- layout ----------
     def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(20)
+        main_layout.setSpacing(16)
 
-        # --- TOP SECTION ---
-        top_layout = QHBoxLayout()
-        top_layout.setSpacing(20)
-
-        # Canvas (Now using InteractiveGraphicsView for Zoom/Pan)
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        left = QVBoxLayout()
         self.canvas = InteractiveGraphicsView()
-        self.canvas.setMinimumSize(800, 300)
-        top_layout.addWidget(self.canvas, stretch=4)
+        self.canvas.setMinimumSize(820, 230)
+        left.addWidget(self.canvas, stretch=1)
+        self.canvas_caption = QLabel("")
+        self.canvas_caption.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        left.addWidget(self.canvas_caption)
+        top.addLayout(left, stretch=4)
 
-        # Results & Progress
-        right_layout = QVBoxLayout()
-        right_layout.setSpacing(15)
+        right = QVBoxLayout()
+        right.setSpacing(12)
 
-        # Result Box
-        result_group = QGroupBox("result")
-        result_layout = QGridLayout(result_group)
-        result_layout.setSpacing(10)
-        
-        self.cd_label = QLabel("C<sub>d</sub>: --")
-        self.cd_label.setTextFormat(Qt.TextFormat.RichText) # Force HTML parsing for subscripts
-        self.dp_label = QLabel("ΔP: --")
-        
-        self.br_label = QLabel("Blockage: --")
-        self.re_label = QLabel("Est. Re: --")
-        
-        self.cd_label.setStyleSheet("color: #a6e3a1; font-size: 18px; font-weight: bold;")
-        self.dp_label.setStyleSheet("color: #f9e2af; font-size: 18px; font-weight: bold;")
-        self.br_label.setStyleSheet("color: #89b4fa; font-size: 13px;")
-        self.re_label.setStyleSheet("color: #cba6f7; font-size: 13px;")
-        
-        result_layout.addWidget(self.cd_label, 0, 0)
-        result_layout.addWidget(self.dp_label, 0, 1)
-        result_layout.addWidget(self.br_label, 1, 0, 1, 2)
-        result_layout.addWidget(self.re_label, 2, 0, 1, 2)
-        
-        right_layout.addWidget(result_group, stretch=1)
+        cnn_group = QGroupBox("CNN prediction (instant)")
+        cnn_group.setProperty("header", "blue")
+        cnn = QGridLayout(cnn_group)
+        self.mask_label = QLabel()
+        self.mask_label.setFixedSize(96, 96)
+        self.mask_label.setToolTip("CNN input: 64x64 obstacle mask")
+        self.cnn_cd = QLabel("C<sub>d</sub> --")
+        self.cnn_cl = QLabel("C<sub>l</sub> --")
+        self.cnn_time = QLabel("")
+        for w, color, size in [(self.cnn_cd, "#a6e3a1", 20), (self.cnn_cl, "#f9e2af", 16),
+                               (self.cnn_time, "#a6adc8", 11)]:
+            w.setTextFormat(Qt.TextFormat.RichText)
+            w.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: bold;")
+        cnn.addWidget(self.mask_label, 0, 0, 3, 1)
+        cnn.addWidget(self.cnn_cd, 0, 1)
+        cnn.addWidget(self.cnn_cl, 1, 1)
+        cnn.addWidget(self.cnn_time, 2, 1)
+        right.addWidget(cnn_group)
 
-        # Progress Box
+        solver_group = QGroupBox("LBM solver (ground truth)")
+        solver_group.setProperty("header", "blue")
+        sol = QGridLayout(solver_group)
+        self.sol_cd = QLabel("C<sub>d</sub> --")
+        self.sol_cl = QLabel("C<sub>l</sub> --")
+        self.sol_info = QLabel("Press RUN SOLVER to verify")
+        self.sol_err = QLabel("")
+        for w, color, size in [(self.sol_cd, "#a6e3a1", 20), (self.sol_cl, "#f9e2af", 16),
+                               (self.sol_info, "#a6adc8", 11), (self.sol_err, "#89dceb", 12)]:
+            w.setTextFormat(Qt.TextFormat.RichText)
+            w.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: bold;")
+        sol.addWidget(self.sol_cd, 0, 0)
+        sol.addWidget(self.sol_cl, 0, 1)
+        sol.addWidget(self.sol_info, 1, 0, 1, 2)
+        sol.addWidget(self.sol_err, 2, 0, 1, 2)
+        right.addWidget(solver_group)
+
         progress_group = QGroupBox("progress")
-        progress_layout = QVBoxLayout(progress_group)
+        pl = QVBoxLayout(progress_group)
         self.progress_widget = CircularProgress()
-        progress_layout.addWidget(self.progress_widget)
-        right_layout.addWidget(progress_group, stretch=1)
+        pl.addWidget(self.progress_widget)
+        right.addWidget(progress_group, stretch=1)
+        top.addLayout(right, stretch=2)
+        main_layout.addLayout(top, stretch=3)
 
-        top_layout.addLayout(right_layout, stretch=1)
-        main_layout.addLayout(top_layout, stretch=3)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
 
-        # --- BOTTOM SECTION ---
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setSpacing(15)
-
-        # Geometry Group
-        shape_group = QGroupBox("Geometry")
+        shape_group = QGroupBox("Geometry [lattice cells]")
         shape_group.setProperty("header", "blue")
-        shape_layout = QVBoxLayout(shape_group)
+        sl = QVBoxLayout(shape_group)
         self.shape_combo = QComboBox()
-        self.shape_combo.addItems(["Circle", "Rectangle", "Triangle"])
-        self.shape_combo.currentTextChanged.connect(self.update_preview)
-        shape_layout.addWidget(self.shape_combo)
-        
-        self.size1_spin = self.create_control_row("Size 1 (Rad/W):", 5.0, 50.0, 10.0, shape_layout)
-        self.size2_spin = self.create_control_row("Size 2 (Height):", 5.0, 50.0, 10.0, shape_layout)
-        self.angle_spin = self.create_control_row("Angle (°):", 0.0, 180.0, 0.0, shape_layout)
-        bottom_layout.addWidget(shape_group)
+        self.shape_combo.addItems(list(SHAPES))
+        self.shape_combo.setCurrentText("Rectangle")
+        self.shape_combo.currentTextChanged.connect(self.inputs_changed)
+        sl.addWidget(self.shape_combo)
+        self.size1_label, self.size1_spin = self.create_control_row("", 1.0, 60.0, 8.0, sl, 0.5)
+        self.size2_label, self.size2_spin = self.create_control_row("", 1.0, 60.0, 16.0, sl, 0.5)
+        _, self.angle_spin = self.create_control_row("Angle (°):", 0.0, 180.0, 30.0, sl, 5.0)
+        bottom.addWidget(shape_group)
 
-        # Fluid Dynamics Group
-        fluid_group = QGroupBox("Fluid Dynamics")
-        fluid_group.setProperty("header", "blue")
-        fluid_layout = QVBoxLayout(fluid_group)
-        self.velocity_spin = self.create_control_row("Inlet Velocity:", 0.01, 0.20, 0.10, fluid_layout, step=0.01)
-        fluid_layout.addStretch()
-        bottom_layout.addWidget(fluid_group)
+        flow_group = QGroupBox("Flow")
+        flow_group.setProperty("header", "blue")
+        fl = QVBoxLayout(flow_group)
+        _, self.re_spin = self.create_control_row("Reynolds number:", 1.0, 200.0, 60.0, fl, 5.0)
+        self.case_label = QLabel("")
+        self.case_label.setWordWrap(True)
+        self.case_label.setTextFormat(Qt.TextFormat.RichText)
+        self.case_label.setStyleSheet("font-size: 12px;")
+        fl.addWidget(self.case_label)
+        fl.addStretch()
+        bottom.addWidget(flow_group, stretch=1)
 
-        # Batch Run Group
-        batch_group = QGroupBox("Batch run")
-        batch_layout = QGridLayout(batch_group)
-        batch_layout.setVerticalSpacing(15)
-        
-        self.radio_single = QRadioButton("Single Run")
+        batch_group = QGroupBox("Mode")
+        bl = QGridLayout(batch_group)
+        self.radio_single = QRadioButton("Single case")
         self.radio_single.setChecked(True)
-        self.radio_batch = QRadioButton("Automated Run :")
-        
-        self.batch_count_spin = QSpinBox()
-        self.batch_count_spin.setRange(1, 10000)
-        self.batch_count_spin.setValue(10)
-        self.batch_count_spin.setEnabled(False)
-        self.batch_count_spin.setMinimumWidth(70)
-        
-        batch_layout.addWidget(self.radio_single, 0, 0, 1, 2)
-        batch_layout.addWidget(self.radio_batch, 1, 0)
-        batch_layout.addWidget(self.batch_count_spin, 1, 1)
-        batch_layout.setRowStretch(2, 1)
-        bottom_layout.addWidget(batch_group)
-        
-        # Automated Tuning Group
-        self.tuning_group = QGroupBox("Automated Tuning")
-        self.tuning_group.setEnabled(False) # Tied to batch radio
-        tuning_layout = QGridLayout(self.tuning_group)
-        
-        self.tune_vel_min = self.create_tuning_spin(0.01, 0.20, 0.02, 0.01)
-        self.tune_vel_max = self.create_tuning_spin(0.01, 0.20, 0.10, 0.01)
-        self.tune_ang_min = self.create_tuning_spin(0.0, 180.0, 0.0, 1.0)
-        self.tune_ang_max = self.create_tuning_spin(0.0, 180.0, 180.0, 1.0)
-        
-        # Shape Opt-in Checkboxes
-        self.tune_shape_circle = QCheckBox("Circle")
-        self.tune_shape_rect = QCheckBox("Rectangle")
-        self.tune_shape_tri = QCheckBox("Triangle")
-        self.tune_shape_circle.setChecked(True)
-        self.tune_shape_rect.setChecked(True)
-        self.tune_shape_tri.setChecked(True)
-        
-        # Apply hand cursors for clear interactivity
-        for cb in [self.tune_shape_circle, self.tune_shape_rect, self.tune_shape_tri]:
+        self.radio_batch = QRadioButton("Generate dataset:")
+        self.batch_count_spin = self.int_spin(1, 100000, 50)
+        bl.addWidget(self.radio_single, 0, 0, 1, 2)
+        bl.addWidget(self.radio_batch, 1, 0)
+        bl.addWidget(self.batch_count_spin, 1, 1)
+        bl.setRowStretch(2, 1)
+        bottom.addWidget(batch_group)
+
+        self.tuning_group = QGroupBox("Dataset settings")
+        self.tuning_group.setEnabled(False)
+        tl = QGridLayout(self.tuning_group)
+        self.seed_spin = self.int_spin(0, 10**6, 0)
+        self.workers_spin = self.int_spin(1, 64, DEFAULT_WORKERS)
+        self.tune_shape = {}
+        shapes_row = QHBoxLayout()
+        for name in SHAPES:
+            cb = QCheckBox(name)
+            cb.setChecked(True)
             cb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        
-        shape_layout_h = QHBoxLayout()
-        shape_layout_h.addWidget(self.tune_shape_circle)
-        shape_layout_h.addWidget(self.tune_shape_rect)
-        shape_layout_h.addWidget(self.tune_shape_tri)
-        
-        tuning_layout.addWidget(QLabel("Vel Min:"), 0, 0); tuning_layout.addWidget(self.tune_vel_min, 0, 1)
-        tuning_layout.addWidget(QLabel("Vel Max:"), 0, 2); tuning_layout.addWidget(self.tune_vel_max, 0, 3)
-        tuning_layout.addWidget(QLabel("Ang Min:"), 1, 0); tuning_layout.addWidget(self.tune_ang_min, 1, 1)
-        tuning_layout.addWidget(QLabel("Ang Max:"), 1, 2); tuning_layout.addWidget(self.tune_ang_max, 1, 3)
-        tuning_layout.addWidget(QLabel("Shapes:"), 2, 0); tuning_layout.addLayout(shape_layout_h, 2, 1, 1, 3)
-        bottom_layout.addWidget(self.tuning_group)
-        
+            shapes_row.addWidget(cb)
+            self.tune_shape[name] = cb
+        self.images_check = QCheckBox("Save flow images")
+        tl.addWidget(QLabel("Seed:"), 0, 0); tl.addWidget(self.seed_spin, 0, 1)
+        tl.addWidget(QLabel("Workers:"), 0, 2); tl.addWidget(self.workers_spin, 0, 3)
+        tl.addWidget(QLabel("Shapes:"), 1, 0); tl.addLayout(shapes_row, 1, 1, 1, 3)
+        tl.addWidget(self.images_check, 2, 0, 1, 4)
+        bottom.addWidget(self.tuning_group)
         self.radio_single.toggled.connect(self.toggle_modes)
 
-        # Simulate Button
-        self.sim_btn = QPushButton("RUN SIMULATION")
-        self.sim_btn.setMinimumSize(200, 60)
+        self.sim_btn = QPushButton("RUN SOLVER")
+        self.sim_btn.setMinimumSize(190, 60)
         font = self.sim_btn.font()
         font.setPointSize(12)
         font.setBold(True)
         self.sim_btn.setFont(font)
-        self.sim_btn.clicked.connect(self.start_simulation_dispatcher)
+        self.sim_btn.clicked.connect(self.start_dispatcher)
         self.sim_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        
-        bottom_layout.addWidget(self.sim_btn, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
-        main_layout.addLayout(bottom_layout, stretch=1)
+        bottom.addWidget(self.sim_btn, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+        main_layout.addLayout(bottom, stretch=1)
 
     def create_control_row(self, label_text, min_val, max_val, default_val, layout, step=1.0):
-        row_widget = QWidget()
-        row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
         label = QLabel(label_text)
-        spinbox = QDoubleSpinBox()
-        spinbox.setRange(min_val, max_val)
-        spinbox.setValue(default_val)
-        spinbox.setSingleStep(step)
-        spinbox.valueChanged.connect(self.update_preview)
-        
-        row_layout.addWidget(label, stretch=1)
-        row_layout.addWidget(spinbox, stretch=1)
-        layout.addWidget(row_widget)
-        return spinbox
+        spin = QDoubleSpinBox()
+        spin.setRange(min_val, max_val)
+        spin.setValue(default_val)
+        spin.setSingleStep(step)
+        spin.valueChanged.connect(self.inputs_changed)
+        rl.addWidget(label, stretch=1)
+        rl.addWidget(spin, stretch=1)
+        layout.addWidget(row)
+        return label, spin
 
-    def create_tuning_spin(self, min_val, max_val, default_val, step):
-        spinbox = QDoubleSpinBox()
-        spinbox.setRange(min_val, max_val)
-        spinbox.setValue(default_val)
-        spinbox.setSingleStep(step)
-        spinbox.setMinimumWidth(60)
-        return spinbox
+    @staticmethod
+    def int_spin(lo, hi, value):
+        s = QSpinBox()
+        s.setRange(lo, hi)
+        s.setValue(value)
+        s.setMinimumWidth(70)
+        return s
 
     def toggle_modes(self):
-        is_batch = self.radio_batch.isChecked()
-        self.batch_count_spin.setEnabled(is_batch)
-        self.tuning_group.setEnabled(is_batch)
+        batch = self.radio_batch.isChecked()
+        self.tuning_group.setEnabled(batch)
+        self.sim_btn.setText("GENERATE" if batch else "RUN SOLVER")
+        self.update_case()
 
-    def update_preview(self):
-        w, h = 800, 200
+    # ---------- current inputs ----------
+    def inputs(self):
+        shape = SHAPES[self.shape_combo.currentText()]
+        s1, s2, angle = self.size1_spin.value(), self.size2_spin.value(), self.angle_spin.value()
+        if shape == "circle":
+            s2, angle = s1, 0.0
+        return shape, s1, s2, angle, self.re_spin.value()
+
+    def inputs_changed(self, *_):
+        self.update_timer.start()  # debounce: recompute 150 ms after the last change
+
+    # ---------- live case info + CNN ----------
+    def update_case(self):
+        shape, s1, s2, angle, re = self.inputs()
+        circle = shape == "circle"
+        self.size1_label.setText("Radius:" if circle else ("Width:" if shape == "rect" else "Base:"))
+        self.size2_label.setText("Height:" if shape == "rect" else "Length:")
+        self.size2_spin.setEnabled(not circle)
+        self.angle_spin.setEnabled(not circle)
+
+        info = case_info(shape, s1, s2, angle, re)
+        lines = [f"D = {info.D:.1f} cells · blockage {info.blockage:.0%} · τ = {info.tau:.3f}"]
+        lines += [f"<span style='color:#f38ba8'>✖ {html.escape(p)}</span>" for p in info.problems]
+        lines += [f"<span style='color:#fab387'>⚠ {html.escape(w)}</span>" for w in info.warnings]
+        if info.solvable and not info.warnings:
+            lines.append("<span style='color:#a6e3a1'>✔ inside the training range</span>")
+        self.case_label.setText("<br>".join(lines))
+        if not self.is_busy():
+            self.sim_btn.setEnabled(info.solvable or self.radio_batch.isChecked())
+
+        mask = None
+        self.cnn_pred = None
+        if info.blockage <= PHYSICS.max_blockage and Path(self.executable).exists():
+            try:
+                t = time.perf_counter()
+                mask = obstacle_mask(shape, s1, s2, angle, re, exe=Path(self.executable))
+                t_mask = time.perf_counter() - t
+                if self.surrogate is not None:
+                    t = time.perf_counter()
+                    self.cnn_pred = self.surrogate.predict(mask, re)
+                    t_cnn = time.perf_counter() - t
+            except Exception as e:
+                self.cnn_time.setText(f"mask error: {e}"[:80])
+        self.show_mask(mask)
+        if self.cnn_pred:
+            cd, cl = self.cnn_pred
+            self.cnn_cd.setText(f"C<sub>d</sub> = {cd:.3f}")
+            self.cnn_cl.setText(f"C<sub>l</sub> = {cl:+.3f}")
+            note = " · outside training range" if info.warnings else ""
+            self.cnn_time.setText(f"{t_cnn * 1000:.0f} ms (+{t_mask * 1000:.0f} ms mask){note}")
+        else:
+            self.cnn_cd.setText("C<sub>d</sub> --")
+            self.cnn_cl.setText("C<sub>l</sub> --")
+            if self.surrogate is None:
+                self.cnn_time.setText("CNN unavailable (pip install -e \".[ml]\")")
+                self.cnn_time.setToolTip(self.surrogate_error)
+            elif mask is None:
+                self.cnn_time.setText("no prediction for this shape")
+
+        if self.solved_inputs is not None and self.solved_inputs == self.inputs():
+            self.update_comparison()
+            return  # keep showing the flow field for these inputs
+        if not self.is_busy():
+            self.clear_solver_panel()
+            self.draw_preview(shape, s1, s2, angle)
+
+    def show_mask(self, mask):
+        if mask is None:
+            self.mask_label.clear()
+            return
+        img = np.flipud(mask).astype(np.uint8) * 255  # row 0 = bottom in lattice y
+        img = np.ascontiguousarray(np.where(img > 0, 230, 40).astype(np.uint8))
+        qimg = QImage(img.data, img.shape[1], img.shape[0], img.shape[1], QImage.Format.Format_Grayscale8)
+        self.mask_label.setPixmap(QPixmap.fromImage(qimg.copy()).scaled(96, 96))
+
+    def draw_preview(self, shape, s1, s2, angle):
+        w, h = int(DOMAIN.nx * SCALE), int(DOMAIN.ny * SCALE)
         pixmap = QPixmap(w, h)
         pixmap.fill(QColor("#1e1e2e"))
-        
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        painter.setPen(QPen(QColor("#89b4fa"), 2, Qt.PenStyle.DashLine))
-        painter.drawLine(0, 2, w, 2)
-        painter.drawLine(0, h-2, w, h-2)
-
-        painter.setPen(QPen(QColor("#45475a"), 2))
-        for y in range(20, h, 30):
-            painter.drawLine(10, y, 40, y)
-            painter.drawLine(30, y-5, 40, y)
-            painter.drawLine(30, y+5, 40, y)
-
-        scale = 2.0
-        cx = (self.domain_nx / 4.0) * scale
-        cy = (self.domain_ny / 2.0) * scale
-
-        shape_display = self.shape_combo.currentText()
-        shape_map = {"Circle": "circle", "Rectangle": "rect", "Triangle": "tri"}
-        shape = shape_map.get(shape_display, "circle")
-
-        s1 = self.size1_spin.value() * scale
-        s2 = self.size2_spin.value() * scale
-        angle = self.angle_spin.value()
-        vel = self.velocity_spin.value()
-
-        # Update Live Readouts
-        L = s2 if shape != "circle" else (s1 * 2)
-        re_est = (vel * (L / scale)) / 0.0333
-        br_est = (L / scale) / self.domain_ny * 100.0
-        
-        self.re_label.setText(f"Est. Re: {re_est:.1f}")
-        self.br_label.setText(f"Blockage: {br_est:.1f}%")
-
-        painter.translate(cx, cy)
-        painter.rotate(angle)
-        painter.setBrush(QBrush(QColor("#f38ba8")))
-        painter.setPen(QPen(QColor("#11111b"), 2))
-
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#89b4fa"), 3))
+        p.drawLine(0, 1, w, 1)
+        p.drawLine(0, h - 2, w, h - 2)
+        p.setPen(QPen(QColor("#45475a"), 2))
+        for y in range(20, h, 30):  # inlet arrows
+            p.drawLine(10, y, 40, y)
+            p.drawLine(30, y - 5, 40, y)
+            p.drawLine(30, y + 5, 40, y)
+        cx, cy = DOMAIN.centre
+        X = lambda x: x * SCALE
+        Y = lambda y: h - y * SCALE  # lattice y points up
+        half = SAMPLING.crop / 2
+        p.setPen(QPen(QColor("#585b70"), 1, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(QRectF(X(cx - half), Y(cy + half), SAMPLING.crop * SCALE, SAMPLING.crop * SCALE))
+        p.setBrush(QBrush(QColor("#f38ba8")))
+        p.setPen(QPen(QColor("#11111b"), 2))
         if shape == "circle":
-            painter.drawEllipse(QPointF(0, 0), s1, s1)
-        elif shape == "rect":
-            painter.drawRect(QRectF(-s1/2, -s2/2, s1, s2))
-        elif shape == "tri":
-            polygon = QPolygonF([
-                QPointF(s2/2, 0),
-                QPointF(-s2/2, s1/2),
-                QPointF(-s2/2, -s1/2)
-            ])
-            painter.drawPolygon(polygon)
-
-        painter.resetTransform()
-        painter.setPen(QColor(255, 255, 255, 20))
-        font = painter.font()
-        font.setPointSize(75)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(QRectF(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "PREVIEW")
-
-        painter.end()
-        
-        # Reset zoom and display the preview
+            p.drawEllipse(QPointF(X(cx), Y(cy)), s1 * SCALE, s1 * SCALE)
+        else:
+            t = math.radians(angle)
+            pts = [QPointF(X(cx + lx * math.cos(t) - ly * math.sin(t)),
+                           Y(cy + lx * math.sin(t) + ly * math.cos(t))) for lx, ly in vertices(shape, s1, s2)]
+            p.drawPolygon(QPolygonF(pts))
+        p.end()
         self.canvas.reset_view()
         self.canvas.setPixmap(pixmap)
+        self.canvas_caption.setText(f"Preview: {DOMAIN.nx} x {DOMAIN.ny} channel, flow left to right. "
+                                    f"Dashed square = CNN input window ({SAMPLING.crop} x {SAMPLING.crop}).")
 
-    def start_simulation_dispatcher(self):
+    # ---------- solver run ----------
+    def is_busy(self):
+        return self.process is not None or self.batch_worker is not None
+
+    def clear_solver_panel(self):
+        self.sol_cd.setText("C<sub>d</sub> --")
+        self.sol_cl.setText("C<sub>l</sub> --")
+        self.sol_info.setText("Press RUN SOLVER to verify")
+        self.sol_err.setText("")
+
+    def start_dispatcher(self):
         if self.radio_single.isChecked():
             self.start_simulation()
         else:
             self.run_batch_mode()
 
     def start_simulation(self):
-        if not os.path.exists(self.executable):
-            QMessageBox.critical(self, "Error", f"Executable '{self.executable}' not found.")
+        if not Path(self.executable).exists():
+            QMessageBox.critical(self, "Error", f"Solver '{self.executable}' not found. Run `make solver`.")
             return
-
-        for f in ["results.csv", "flow_field.ppm", "flow_field.png"]:
-            if os.path.exists(f): os.remove(f)
-
+        shape, s1, s2, angle, re = self.inputs()
+        if not case_info(shape, s1, s2, angle, re).solvable:
+            return
+        self.run_inputs = (shape, s1, s2, angle, re)
+        self.run_dir = tempfile.TemporaryDirectory(prefix="cfd_gui_")
+        self.total_steps = PHYSICS.warmup_steps(DOMAIN.nx) + PHYSICS.avg_steps(DOMAIN.nx)
         self.sim_btn.setEnabled(False)
-        self.sim_btn.setText("SIMULATING...")
-        self.progress_widget.update_progress(0, 15000, "0/15000 steps")
-
-        shape_display = self.shape_combo.currentText()
-        shape_map = {"Circle": "circle", "Rectangle": "rect", "Triangle": "tri"}
-        shape = shape_map.get(shape_display, "circle")
-        
-        s1 = str(self.size1_spin.value())
-        s2 = str(self.size2_spin.value())
-        angle = str(self.angle_spin.value())
-        vel = str(self.velocity_spin.value())
-
+        self.sim_btn.setText("SOLVING...")
+        self.sol_info.setText("solving...")
+        self.progress_widget.update_progress(0, self.total_steps, f"0/{self.total_steps} steps")
+        self.t_start = time.perf_counter()
         self.process = QProcess(self)
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.finished.connect(self.simulation_finished)
-
-        args = [
-            "--width", str(self.domain_nx), "--height", str(self.domain_ny),
-            "--shape", shape, "--size1", s1, "--size2", s2,
-            "--angle", angle, "--velocity", vel, "--steps", "15000"
-        ]
-        
-        self.process.start(self.executable, args)
+        self.process.start(self.executable, ["--out-dir", self.run_dir.name,
+                                             *solver_args(shape, s1, s2, angle, re)])
 
     def handle_stdout(self):
-        output = self.process.readAllStandardOutput().data().decode()
-        for line in output.replace('\r', '\n').split('\n'):
-            if "Step" in line and "/" in line:
+        out = self.process.readAllStandardOutput().data().decode(errors="replace")
+        for line in out.replace("\r", "\n").split("\n"):
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "Step" and parts[2] == "/":
                 try:
-                    parts = line.strip().split()
-                    step = int(parts[1])
-                    total = int(parts[3])
+                    step, total = int(parts[1]), int(parts[3])
                     self.progress_widget.update_progress(step, total, f"{step}/{total} steps")
-                except:
+                except ValueError:
                     pass
-            elif "Steady-state convergence reached" in line:
-                self.progress_widget.update_progress(15000, 15000, "15000/15000 steps")
 
     def simulation_finished(self):
+        seconds = time.perf_counter() - self.t_start
+        code = self.process.exitCode()
+        crashed = self.process.exitStatus() != QProcess.ExitStatus.NormalExit
+        self.process = None
+        self.sim_btn.setText("RUN SOLVER")
         self.sim_btn.setEnabled(True)
-        self.sim_btn.setText("RUN SIMULATION")
+        self.progress_widget.update_progress(1, 1, f"done in {seconds:.0f} s")
+        shape, s1, s2, angle, re = self.run_inputs
+        case = Case(0, shape, s1, s2, angle, re, case_info(shape, s1, s2, angle, re).D)
+        run_dir = Path(self.run_dir.name)
+        error = "crashed" if crashed else ("" if code in (0, 3) else f"exit {code}")
+        row, _ = collect_case(case, run_dir, error, DOMAIN, SAMPLING, None)
+        if (run_dir / "flow_field.ppm").exists():
+            with Image.open(run_dir / "flow_field.ppm") as img:
+                rgb = np.ascontiguousarray(img.convert("RGB"))
+            qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QImage.Format.Format_RGB888)
+            pix = QPixmap.fromImage(qimg.copy()).scaled(int(DOMAIN.nx * SCALE), int(DOMAIN.ny * SCALE),
+                                                         Qt.AspectRatioMode.IgnoreAspectRatio,
+                                                         Qt.TransformationMode.SmoothTransformation)
+            self.canvas.reset_view()
+            self.canvas.setPixmap(pix)
+            self.canvas_caption.setText(f"Velocity magnitude (time step at the end of averaging), "
+                                        f"{shape}, Re = {re:g}. Scroll to zoom, drag to pan.")
+        self.run_dir.cleanup()
+        self.run_dir = None
+        self.last_row = row
+        if row["ok"]:
+            self.solved_inputs = self.run_inputs
+            self.sol_cd.setText(f"C<sub>d</sub> = {row['Cd']:.3f}")
+            self.sol_cl.setText(f"C<sub>l</sub> = {row['Cl']:+.3f}")
+            regime = "vortex shedding" if row["status"] == "periodic" else "steady"
+            self.sol_info.setText(f"{regime} · C<sub>l,rms</sub> = {row['Cl_rms']:.3f} · {seconds:.0f} s")
+            self.update_comparison()
+        else:
+            self.solved_inputs = None
+            self.sol_info.setText(f"<span style='color:#f38ba8'>failed: {html.escape(row['error'])}</span>")
+        self.update_case()
 
-        if self.process.exitStatus() != QProcess.ExitStatus.NormalExit:
-            QMessageBox.warning(self, "Error", "Simulation crashed or was terminated.")
+    def update_comparison(self):
+        row = self.last_row
+        if not self.cnn_pred or not row["ok"]:
+            self.sol_err.setText("")
             return
+        cd, cl = self.cnn_pred
+        err = abs(cd - row["Cd"]) / abs(row["Cd"])
+        self.sol_err.setText(f"CNN error: C<sub>d</sub> {err:.1%} · C<sub>l</sub> {abs(cl - row['Cl']):.3f} (abs)")
 
-        if os.path.exists("results.csv"):
-            try:
-                with open("results.csv", 'r') as f:
-                    reader = csv.DictReader(f)
-                    row = next(reader)
-                    cd_val = float(row["Cd"])
-                    dp_val = float(row["pressure_loss"])
-                    self.cd_label.setText(f"C<sub>d</sub>: {cd_val:.4f}")
-                    self.dp_label.setText(f"ΔP: {dp_val:.5f}")
-            except Exception as e:
-                self.cd_label.setText("C<sub>d</sub>: Error")
-
-        if os.path.exists("flow_field.ppm"):
-            try:
-                with Image.open("flow_field.ppm") as img:
-                    img.save("flow_field.png", format="PNG")
-                
-                pixmap = QPixmap("flow_field.png")
-                scaled_pixmap = pixmap.scaled(800, 200, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-                
-                # Reset zoom and display the result image
-                self.canvas.reset_view()
-                self.canvas.setPixmap(scaled_pixmap)
-            except Exception as e:
-                QMessageBox.warning(self, "Image Error", f"Failed to render flow field: {e}")
-
+    # ---------- dataset generation ----------
     def run_batch_mode(self):
-        if not os.path.exists(self.executable):
-            QMessageBox.critical(self, "Error", f"Executable '{self.executable}' not found.")
+        if not Path(self.executable).exists():
+            QMessageBox.critical(self, "Error", f"Solver '{self.executable}' not found. Run `make solver`.")
             return
-
-        selected_shapes = []
-        if self.tune_shape_circle.isChecked(): selected_shapes.append("circle")
-        if self.tune_shape_rect.isChecked(): selected_shapes.append("rect")
-        if self.tune_shape_tri.isChecked(): selected_shapes.append("tri")
-
-        if len(selected_shapes) == 0:
-            QMessageBox.warning(self, "Selection Required", "Please select at least one shape variant to generate.")
+        shapes = [SHAPES[name] for name, cb in self.tune_shape.items() if cb.isChecked()]
+        if not shapes:
+            QMessageBox.warning(self, "Selection required", "Select at least one shape.")
             return
-
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Output Directory for Dataset")
-        if not dir_path: return
-
-        count = self.batch_count_spin.value()
-        
-        tuning_params = {
-            'vel_min': self.tune_vel_min.value(),
-            'vel_max': self.tune_vel_max.value(),
-            'ang_min': self.tune_ang_min.value(),
-            'ang_max': self.tune_ang_max.value(),
-            'shapes': selected_shapes
-        }
-
+        out = QFileDialog.getExistingDirectory(self, "Output folder (re-use a folder to resume)")
+        if not out:
+            return
+        n = self.batch_count_spin.value()
         self.sim_btn.setEnabled(False)
-        self.progress_widget.update_progress(0, count, f"0/{count} samples")
-
-        self.batch_worker = BatchWorker(self.executable, dir_path, count, tuning_params)
-        self.batch_worker.progress.connect(self.update_batch_progress)
-        self.batch_worker.finished.connect(self.batch_finished)
+        self.progress_widget.update_progress(0, n, f"0/{n} cases")
+        self.batch_worker = BatchWorker(out, n, self.seed_spin.value(), self.workers_spin.value(),
+                                        shapes, self.images_check.isChecked())
+        self.batch_worker.progress.connect(
+            lambda d, t: self.progress_widget.update_progress(d, t, f"{d}/{t} cases"))
+        self.batch_worker.finished_ok.connect(self.batch_finished)
         self.batch_worker.error.connect(self.batch_error)
         self.batch_worker.start()
 
-    def update_batch_progress(self, current, total):
-        self.progress_widget.update_progress(current, total, f"{current}/{total} samples")
-
     def batch_finished(self, msg):
         self.batch_cleanup()
-        QMessageBox.information(self, "Batch Complete", msg)
+        QMessageBox.information(self, "Dataset ready", msg)
 
     def batch_error(self, err):
         self.batch_cleanup()
-        QMessageBox.critical(self, "Batch Error", f"An error occurred: {err}")
+        QMessageBox.critical(self, "Generation error", err)
 
     def batch_cleanup(self):
-        self.sim_btn.setEnabled(True)
-        self.progress_widget.update_progress(100, 100, "Done")
+        self.batch_worker.wait()
         self.batch_worker = None
+        self.sim_btn.setEnabled(True)
+        self.progress_widget.update_progress(1, 1, "done")
 
     def apply_dark_theme(self):
         self.setStyleSheet("""
@@ -741,8 +694,37 @@ class LBMSolverGUI(QMainWindow):
             }
         """)
 
-if __name__ == "__main__":
+
+def take_screenshot(window, path, inputs=("Rectangle", 8.0, 16.0, 30.0, 60.0)):
+    """Run one demo case with the solver, then save a screenshot of the window and quit."""
+    shape, s1, s2, angle, re = inputs
+    window.shape_combo.setCurrentText(shape)
+    window.size1_spin.setValue(s1)
+    window.size2_spin.setValue(s2)
+    window.angle_spin.setValue(angle)
+    window.re_spin.setValue(re)
+    window.update_case()
+    window.start_simulation()
+
+    def poll():
+        if window.process is None:
+            QApplication.processEvents()
+            window.grab().save(str(path))
+            print(f"saved {path}")
+            QApplication.quit()
+        else:
+            QTimer.singleShot(500, poll)
+    QTimer.singleShot(500, poll)
+
+
+def main():
     app = QApplication(sys.argv)
     window = LBMSolverGUI()
     window.show()
+    if "--screenshot" in sys.argv:
+        take_screenshot(window, Path(sys.argv[sys.argv.index("--screenshot") + 1]))
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
