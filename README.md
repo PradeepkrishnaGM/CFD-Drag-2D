@@ -25,8 +25,8 @@ Designed as a complete aerodynamic "data factory," the project features a custom
   Schäfer–Turek 2D-1 cylinder benchmark (Cd = 5.58 at Re = 20).
 
 ## Status
-Work in progress. Done: validated solver, CPU and CUDA dataset pipeline, a 5000-case dataset.
-Planned next: a CNN surrogate that predicts drag from geometry, then the GUI update.
+Work in progress. Done: validated solver, CPU and CUDA dataset pipeline, a 5000-case dataset,
+a CNN surrogate that predicts Cd and Cl from geometry. Planned next: the GUI update.
 See `SPEC.md` for the full plan and `DECISIONS.md` for design choices.
 
 ## Prerequisites
@@ -60,6 +60,11 @@ python scripts/generate.py --n 1000 --seed 0 --backend cuda --out dataset
 
 # 7. Check a dataset (writes summary.json; exits 1 if a check fails)
 python scripts/check_dataset.py --data dataset
+
+# 8. CNN surrogate (optional [ml] extra; CPU torch shown)
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu && uv pip install -e ".[ml]"
+python scripts/train.py --data dataset --out runs/v1        # ~15 s/epoch on CPU, ~1 s on a T4
+python scripts/evaluate.py --data dataset --run runs/v1     # metrics.json, predictions.csv, parity.png
 ```
 
 All tunable defaults (domain size, steps, sampling ranges) live in `cfd_drag/params.py`.
@@ -90,3 +95,30 @@ solver, re-solves 8 random cases on the CPU as a reproducibility check, and runs
 | Size | 21 MB (`data.csv`, `masks.npy`, config and check files) |
 
 The dataset is a private Kaggle dataset for now (link to follow when it is made public).
+
+## Surrogate model
+A small CNN (4 conv blocks, 0.26 M parameters) predicts Cd and Cl from the 64x64 obstacle mask;
+log(Re) joins in the dense head. It is trained on 3500 cases of the dataset above, the best epoch is
+chosen on 750 validation cases, and it is scored once on 750 held-out test cases.
+`notebooks/m5_train_surrogate.ipynb` trains it on a Kaggle T4 (about 160 s for 150 epochs).
+
+Test set, CNN as mean ± standard deviation over 3 training seeds (same split):
+
+| Model | Cd MAE | Cd R² | Cd mean rel. error | Cd 95th pct rel. error | Cl MAE | Cl R² |
+|---|---|---|---|---|---|---|
+| Mean predictor | 0.429 | 0.00 | 20.0 % | 49.9 % | 0.458 | 0.00 |
+| Gradient boosting on shape parameters | 0.073 | 0.966 | 3.4 % | 10.2 % | 0.101 | 0.937 |
+| **CNN on mask + Re** | **0.051 ± 0.002** | **0.981** | **2.3 ± 0.1 %** | **6.8 %** | **0.060 ± 0.007** | **0.973** |
+
+The CNN sees only pixels and Re, while the gradient-boosting baseline gets the exact shape
+parameters; the CNN is still better for every shape and in both flow regimes
+(Cd mean relative error: circles 0.8 %, rectangles 2.8 %, triangles 3.4 %; steady 1.8 %,
+vortex shedding 2.9 %).
+
+Limits:
+- The surrogate error is about as large as the solver's own discretisation error (Cd 2.6 % below
+  the Schäfer–Turek benchmark at D = 20 cells), so lower numbers would mostly fit solver artefacts.
+- Trained on one channel setup (no-slip walls, blockage up to 25 %, so Cd is above free-stream
+  values), three shape families and Re 20 to 100. Other shapes or flow conditions are untested.
+- Cl of circles (true value about 0): CNN MAE 0.018 against 0.005 for gradient boosting, which is
+  told the shape is a circle; a pixelated circle is not perfectly symmetric.

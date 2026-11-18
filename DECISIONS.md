@@ -39,3 +39,5 @@
 | 2026-11-18 | M5 surrogate: Re (standardised log Re) joins the CNN in the dense head; split 70/15/15 by sample, seed 0 | Mask stays binary; 750 test cases give stable metrics |
 | 2026-11-18 | M5 metrics: MAE + R² for Cd and Cl, relative error for Cd only; pass = CNN beats mean and gradient-boosting baselines on test Cd MAE | Cl median ~0 makes relative error meaningless; a fixed % target invites tuning to the test set |
 | 2026-11-18 | ML dependencies (torch, scikit-learn, matplotlib) as optional extra `[ml]`; checkpoints stay out of git until M6 | Keeps the solver/dataset install light |
+| 2026-11-18 | Training seed is a CLI option (`--seed`, default 0); the split seed stays fixed | Seed spread measured on the same test set |
+| 2026-11-18 | Surrogate v1 (commits 38ce07f / 38db73e, Kaggle T4): CNN test Cd MAE 0.051 ± 0.002, Cd rel 2.3 ± 0.1 %, Cl MAE 0.060 ± 0.007 (3 seeds) vs gradient boosting 0.073 / 3.4 % / 0.101 -> passes | Owner reviewed; README reports mean ± std and the limits |
