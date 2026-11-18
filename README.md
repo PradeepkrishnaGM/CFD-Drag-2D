@@ -1,6 +1,6 @@
-# CFD-Drag-2D: Lattice Boltzmann Solver, Drag Dataset and CNN Surrogate
+# CFD-Drag-2D: Lattice Boltzmann Solver, Flow Dataset and Neural Surrogates
 
-![C++](https://img.shields.io/badge/C++-17-blue) ![CUDA](https://img.shields.io/badge/CUDA-batch%20solver-green) ![Python](https://img.shields.io/badge/Python-3.10+-yellow) ![PyTorch](https://img.shields.io/badge/PyTorch-CNN-orange) ![License](https://img.shields.io/badge/License-MIT-green)
+![C++](https://img.shields.io/badge/C++-17-blue) ![CUDA](https://img.shields.io/badge/CUDA-batch%20solver-green) ![Python](https://img.shields.io/badge/Python-3.10+-yellow) ![PyTorch](https://img.shields.io/badge/PyTorch-CNN%20%2B%20U--Net-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Overview
 A complete, reproducible pipeline from physics to machine learning:
@@ -12,13 +12,16 @@ A complete, reproducible pipeline from physics to machine learning:
 3. **Surrogate:** a small CNN that predicts drag (Cd) and lift (Cl) from the obstacle shape and Re
    in milliseconds, with a 2.3 % mean Cd error, beating a gradient-boosting baseline that is
    given the exact shape parameters.
-4. **Flow Studio:** a desktop app to design an obstacle, see the CNN prediction instantly, and
-   check it against the full simulation.
+4. **Flow-field surrogate (v2):** a U-Net that predicts the whole time-averaged velocity and
+   pressure field around the obstacle, trained on the same 5000 cases with stored mean fields.
+5. **Flow Studio:** a desktop app to design an obstacle, see the CNN and U-Net predictions
+   instantly, and check them against the full simulation.
 
 ![Flow Studio](docs/gui.png)
 
-*Flow Studio: the CNN predicts Cd = 2.31 in about 15 ms; the solver gives 2.39 after 42 s (3.3 % error).
-Vortex shedding behind a rectangle at Re = 60.*
+*Flow Studio, rotated rectangle at Re = 60 (vortex shedding): the CNN predicts Cd = 2.31 and the U-Net
+the whole time-averaged flow field (shown) in about 50 ms together; the solver gives Cd = 2.39 after 35 s.
+U-Net field error for this case: velocity 3.6 %, Cp 6.8 %.*
 
 ## Features
 * **CPU and CUDA engines:** both share one per-node update (`cfd_engine/lbm_common.hpp`). The CUDA
@@ -29,9 +32,11 @@ Vortex shedding behind a rectangle at Re = 60.*
   identical results for any worker count or GPU batch size, dataset checks and a CPU spot check.
 * **CNN surrogate:** PyTorch, trained on Kaggle GPUs from a notebook that clones this repository;
   evaluated against mean and gradient-boosting baselines over 3 training seeds.
-* **Flow Studio (PyQt6):** live CNN prediction with input validation, full solver run with flow
-  field, and dataset generation from the GUI.
-* **Tested:** 49 tests, including physics validation, determinism and GPU-vs-CPU agreement.
+* **U-Net field surrogate:** time-averaged ux, uy and Cp on a 256x96 window around the obstacle,
+  compared with mean-field and nearest-neighbour baselines over 3 training seeds.
+* **Flow Studio (PyQt6):** live CNN and U-Net predictions with input validation, full solver run,
+  side-by-side field views (U-Net, solver, difference), and dataset generation from the GUI.
+* **Tested:** 58 tests, including physics validation, determinism and GPU-vs-CPU agreement.
 
 ## Solver
 * D2Q9 lattice Boltzmann with TRT collision, half-way bounce-back walls, Zou-He velocity inlet
@@ -44,7 +49,7 @@ Vortex shedding behind a rectangle at Re = 60.*
   Schäfer–Turek 2D-1 cylinder benchmark (Cd = 5.58 at Re = 20).
 
 ## Status
-Complete (milestones M0 to M6). See `SPEC.md` for the specification and `DECISIONS.md` for every
+Complete (milestones M0 to M9; v1.0 drag surrogate, v2.0 flow-field surrogate). See `SPEC.md` for the specification and `DECISIONS.md` for every
 design choice and result.
 
 ## Prerequisites
@@ -83,6 +88,12 @@ python scripts/check_dataset.py --data dataset
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu && uv pip install -e ".[ml]"
 python scripts/train.py --data dataset --out runs/v1        # ~15 s/epoch on CPU, ~1 s on a T4
 python scripts/evaluate.py --data dataset --run runs/v1     # metrics.json, predictions.csv, parity.png
+
+# 9. Flow-field U-Net (needs step 8): download the trained weights for Flow Studio (31 MB),
+#    or train and evaluate on the v2 field dataset (GPU recommended)
+python scripts/fetch_field_model.py                         # -> models/field_unet_v1.pt
+python scripts/train_fields.py --data cfd_drag_2d_fields --out runs/fields --device cuda
+python scripts/evaluate_fields.py --data cfd_drag_2d_fields --run runs/fields
 ```
 
 All tunable defaults (domain size, steps, sampling ranges) live in `cfd_drag/params.py`.
@@ -92,6 +103,7 @@ A dataset directory contains:
 1. `data.csv`: one row per case with the inputs (`shape`, `size1`, `size2`, `angle`, `re`, frontal height `D`, `blockage`) and the targets (`Cd`, `Cl`, `Cl_rms`, `pressure_loss`), plus `status` (steady/periodic) and `ok`.
 2. `masks.npy`: `(N, 64, 64)` uint8 obstacle masks cropped around the obstacle, aligned with `data.csv` rows. These are the CNN inputs.
 3. `images/`: optional velocity-magnitude PNGs, for visualisation only.
+4. `fields.npy` (field datasets only, `--fields`): `(N, 3, 96, 256)` float16 time-averaged `ux / U`, `uy / U` and `Cp` in a window around the obstacle.
 
 Load it with `cfd_drag.dataset.load("dataset")`. `example_data/` holds 24 cases.
 
@@ -126,6 +138,12 @@ from cfd_drag.dataset import load
 df, masks = load("cfd_drag_2d")   # data.csv as a DataFrame, masks as (5000, 64, 64) uint8
 ```
 
+**Field dataset (v2):** `cfd_drag_2d_fields_v2.zip` (0.5 GB; 0.76 GB unpacked) on the
+[v2.0 release](https://github.com/PradeepkrishnaGM/CFD-Drag-2D/releases/tag/v2.0) holds the same
+files plus `fields.npy`, `(5000, 3, 96, 256)` float16 (`ux / U`, `uy / U`, `Cp`), aligned with
+`data.csv` (zeros for failed rows; there are none). Load it with
+`cfd_drag.surrogate.fields.load_field_dataset("cfd_drag_2d_fields")`.
+
 ## Surrogate model
 A small CNN (4 conv blocks, 0.26 M parameters) predicts Cd and Cl from the 64x64 obstacle mask;
 log(Re) joins in the dense head. It is trained on 3500 cases of the dataset above, the best epoch is
@@ -153,6 +171,48 @@ Limits:
 - Cl of circles (true value about 0): CNN MAE 0.018 against 0.005 for gradient boosting, which is
   told the shape is a circle; a pixelated circle is not perfectly symmetric.
 
+## Flow-field surrogate (v2)
+The v2 dataset stores, for the same 5000 cases, the **time-averaged** velocity and pressure
+(`ux / U`, `uy / U` and `Cp`) on a 256 x 96 cell window from 32 cells upstream of the obstacle centre
+across the full channel height (averaged over the same steps as Cd and Cl). `notebooks/m7_generate_fields.ipynb`
+generates it on Kaggle; Cd, Cl and the masks are identical to v1, and the checks add no-slip on
+obstacle cells and constant volume flux through every window column (max deviation 1.0 %).
+
+A U-Net (4 levels, 7.8 M parameters) maps three input channels, the obstacle mask, its signed
+distance field and log(Re), to the three output fields. It is trained on the same 3500 / 750 / 750
+split as the CNN (100 epochs, about 26 min on a T4, `notebooks/m8_train_fields.ipynb`).
+Errors are relative L2 norms over fluid cells on the 750 test cases (lower is better):
+
+Test set, U-Net as mean ± standard deviation over 3 training seeds (same split):
+
+| Model | Velocity rel. L2 | Cp rel. L2 | Velocity, wake | Cp, wake | Velocity 95th pct |
+|---|---|---|---|---|---|
+| Mean training field | 10.4 % | 45.5 % | 9.9 % | 56.8 % | 16.0 % |
+| Nearest neighbour in shape parameters | 2.8 % | 12.5 % | 2.6 % | 15.4 % | 6.9 % |
+| **U-Net on mask + signed distance + Re** | **1.93 ± 0.02 %** | **5.05 ± 0.08 %** | **2.02 ± 0.02 %** | **8.4 ± 0.2 %** | **4.6 %** |
+
+"Wake" is the part of the window downstream of the obstacle centre.
+
+The nearest-neighbour baseline copies the field of the training case with the closest shape
+parameters and Re. The U-Net more than halves its Cp error and is better for rectangles and
+triangles and in both flow regimes. One exception: circles have only two parameters (size and Re),
+so a near-identical training case almost always exists, and nearest neighbour has the lower
+velocity error there (0.7 % against 0.9 %; Cp 3.2 % against 2.8 %).
+U-Net velocity error by group: circles 0.9 %, rectangles 2.2 %, triangles 2.7 %; steady 1.3 %,
+vortex shedding 2.7 %.
+
+![U-Net vs solver](docs/fields.png)
+
+*Test cases at the 10th, 50th and 90th percentile of the U-Net velocity error: solver, U-Net, speed
+error and Cp error.*
+
+Limits:
+- Vortex shedding cases have about twice the error of steady ones; the U-Net predicts the mean flow,
+  not the unsteady shedding.
+- The largest errors are in the far wake, where faint block patterns at the U-Net's coarsest scale
+  (16 cells) appear.
+- Same channel setup, shape families and Re range as the CNN.
+
 ## Flow Studio
 `python gui/app.py`
 * **Geometry and flow:** shape, sizes and angle in lattice cells, and the Reynolds number. The
@@ -160,11 +220,20 @@ Limits:
   rejects (unstable τ, blockage above 25 %) or that lie outside the CNN's training range.
 * **CNN prediction (instant):** on every change the app builds the exact 64x64 mask the CNN was
   trained on (one solver step, ~20 ms) and predicts Cd and Cl with `models/surrogate_v1.pt`.
-* **Run solver:** the full simulation with the dataset settings (about 40 s on a 6-core desktop CPU), the
-  velocity field, Cd, Cl, Cl_rms, flow regime and the CNN's error against the solver.
+* **U-Net field (instant):** the predicted time-averaged speed, ux, uy or Cp around the obstacle
+  (about 35 ms on the CPU, `models/field_unet_v1.pt`, see step 9 of the Quick Start).
+* **Run solver:** the full simulation with the dataset settings (about 40 s on a 6-core desktop CPU),
+  Cd, Cl, Cl_rms, flow regime, the CNN's error and the U-Net field error against the solver.
+* **Views:** shape preview, U-Net prediction, solver mean field, and the difference U-Net minus solver,
+  each with fixed colour ranges so views are comparable.
 * **Generate dataset:** the same pipeline as `scripts/generate.py` (seed, size, workers, shapes),
   resumable by choosing the same folder again.
-* `python gui/app.py --screenshot docs/gui.png` runs a demo case and saves the screenshot above.
+* `python gui/app.py --screenshot docs/gui.png [--view "Solver result"]` runs a demo case and saves a screenshot.
+
+![Difference view](docs/gui_difference.png)
+
+*Difference view (U-Net minus solver, speed): the error sits in the far wake, where the mean of the
+shedding vortices is hardest to predict.*
 
 ![Parity plot](docs/parity.png)
 
@@ -174,10 +243,12 @@ Limits:
 ```
 cfd_engine/      C++ and CUDA lattice Boltzmann solvers (shared per-node update)
 cfd_drag/        Python package: params, geometry, sampling, dataset pipeline, checks,
-                 surrogate (data, model, training, metrics), single-case prediction
-scripts/         generate.py, check_dataset.py, train.py, evaluate.py, compare_backends.py
-notebooks/       Kaggle notebooks: CUDA check (M3), dataset generation (M4), training (M5)
+                 surrogates (CNN and U-Net: data, models, training, metrics), single-case prediction
+scripts/         generate.py, check_dataset.py, train.py, evaluate.py, compare_backends.py,
+                 train_fields.py, evaluate_fields.py, fetch_field_model.py
+notebooks/       Kaggle notebooks: CUDA check (M3), dataset generation (M4), training (M5),
+                 field dataset (M7), U-Net training (M8)
 gui/app.py       Flow Studio
-models/          trained surrogate (1 MB)
+models/          trained CNN (1 MB); the U-Net (31 MB) is downloaded by fetch_field_model.py
 tests/           pytest suite (`make test` quick, `make test-all` with slow physics validation)
 ```
