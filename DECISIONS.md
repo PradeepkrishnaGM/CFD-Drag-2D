@@ -36,3 +36,6 @@
 | 2026-11-18 | Kaggle dataset private until M6; dataset check fails below 95 % ok cases | Owner approval |
 | 2026-11-18 | Dataset check (cfd_drag/check.py) plus a CPU spot check of 8 random cases run inside the generation notebook | Catches broken data before training; proves GPU results are reproducible from the code |
 | 2026-11-18 | Dataset v1: 5000 cases from commit 96556fb, 100 % ok, spot check max rel diff 4e-10; 59 min on 2x T4 (0.70 s/case) | Kaggle run 2026-11-18; private Kaggle dataset doffice2026/cfd-drag-2d-lbm |
+| 2026-11-18 | M5 surrogate: Re (standardised log Re) joins the CNN in the dense head; split 70/15/15 by sample, seed 0 | Mask stays binary; 750 test cases give stable metrics |
+| 2026-11-18 | M5 metrics: MAE + R² for Cd and Cl, relative error for Cd only; pass = CNN beats mean and gradient-boosting baselines on test Cd MAE | Cl median ~0 makes relative error meaningless; a fixed % target invites tuning to the test set |
+| 2026-11-18 | ML dependencies (torch, scikit-learn, matplotlib) as optional extra `[ml]`; checkpoints stay out of git until M6 | Keeps the solver/dataset install light |

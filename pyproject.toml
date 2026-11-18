@@ -3,12 +3,17 @@ name = "cfd-drag"
 version = "0.1.0"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+# CNN surrogate (M5). Locally use the CPU wheel:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cpu && uv pip install -e ".[ml]"
+ml = ["torch>=2.2", "scikit-learn>=1.4", "matplotlib>=3.8"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["cfd_drag"]
+packages = ["cfd_drag", "cfd_drag.surrogate"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

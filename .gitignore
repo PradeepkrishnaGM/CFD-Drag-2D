@@ -10,3 +10,6 @@ dataset/
 results.csv
 flow_field.ppm
 flow_field.png
+
+# Training runs (M5)
+runs/

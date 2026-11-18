@@ -67,8 +67,27 @@ class CheckParams:
     min_ok_fraction: float = 0.95  # dataset check fails if fewer cases than this solved cleanly
 
 
+@dataclass(frozen=True)
+class TrainParams:
+    split_seed: int = 0                     # train/val/test split by sample
+    val_fraction: float = 0.15
+    test_fraction: float = 0.15
+    channels: tuple[int, ...] = (32, 64, 128, 128)  # conv blocks (each halves the image)
+    hidden: int = 128                       # dense head width
+    loss_weight_cd: float = 1.0             # MSE weights on standardised targets
+    loss_weight_cl: float = 0.5
+    lr: float = 1e-3                        # AdamW, cosine schedule to 0
+    weight_decay: float = 1e-4
+    batch_size: int = 128
+    epochs: int = 150                       # best epoch by validation Cd MAE is kept
+    seed: int = 0                           # weight init and batch order
+    gbm_max_iter: int = 500                 # gradient-boosting baseline
+    gbm_learning_rate: float = 0.05
+
+
 DOMAIN = DomainParams()
 PHYSICS = PhysicsParams()
 SAMPLING = SamplingParams()
 GPU = GpuParams()
 CHECK = CheckParams()
+TRAIN = TrainParams()
