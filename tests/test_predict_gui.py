@@ -41,6 +41,7 @@ def test_surrogate_predicts_example_cases(solver_exe):
 
 def test_gui_live_prediction_and_validation(solver_exe):
     pytest.importorskip("torch")
+    pytest.importorskip("PyQt6")  # not installed on Kaggle
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
     import sys
