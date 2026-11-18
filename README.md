@@ -17,7 +17,7 @@ A complete, reproducible pipeline from physics to machine learning:
 
 ![Flow Studio](docs/gui.png)
 
-*Flow Studio: the CNN predicts Cd = 2.31 in 2 ms; the solver gives 2.39 after 42 s (3.3 % error).
+*Flow Studio: the CNN predicts Cd = 2.31 in about 15 ms; the solver gives 2.39 after 42 s (3.3 % error).
 Vortex shedding behind a rectangle at Re = 60.*
 
 ## Features
