@@ -36,7 +36,7 @@ U-Net field error for this case: velocity 3.6 %, Cp 6.8 %.*
   compared with mean-field and nearest-neighbour baselines over 3 training seeds.
 * **Flow Studio (PyQt6):** live CNN and U-Net predictions with input validation, full solver run,
   side-by-side field views (U-Net, solver, difference), and dataset generation from the GUI.
-* **Tested:** 76 tests, including physics validation, determinism, exact mirror symmetry and GPU-vs-CPU agreement.
+* **Tested:** 77 tests, including physics validation, determinism, exact mirror symmetry and GPU-vs-CPU agreement.
 
 ## Solver
 * D2Q9 lattice Boltzmann with TRT collision, half-way bounce-back walls, Zou-He velocity inlet
