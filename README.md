@@ -36,7 +36,7 @@ U-Net field error for this case: velocity 3.6 %, Cp 6.8 %.*
   compared with mean-field and nearest-neighbour baselines over 3 training seeds.
 * **Flow Studio (PyQt6):** live CNN and U-Net predictions with input validation, full solver run,
   side-by-side field views (U-Net, solver, difference), and dataset generation from the GUI.
-* **Tested:** 58 tests, including physics validation, determinism and GPU-vs-CPU agreement.
+* **Tested:** 76 tests, including physics validation, determinism, exact mirror symmetry and GPU-vs-CPU agreement.
 
 ## Solver
 * D2Q9 lattice Boltzmann with TRT collision, half-way bounce-back walls, Zou-He velocity inlet
@@ -47,9 +47,15 @@ U-Net field error for this case: velocity 3.6 %, Cp 6.8 %.*
   pressure loss, a steady/periodic flag, and optionally the mask and flow fields as `.npy`.
 * Validated in `tests/`: determinism, mass conservation, channel (Poiseuille) flow, and the
   Schäfer–Turek 2D-1 cylinder benchmark (Cd = 5.58 at Re = 20).
+* Options (M10): `--walls freeslip` replaces the no-slip channel walls by free-slip walls (specular
+  reflection; cylinder D = 20, Re = 40: Cd 2.84 -> 2.17), and `--precision float` stores the
+  populations as float32 deviations from equilibrium weights. Float is **4x faster on a T4**
+  (0.18 s instead of 0.71 s per case) and matches double to 2e-6 in Cd on steady cases and 2e-4 on
+  vortex-shedding cases. Defaults stay no-slip and double, so the published datasets are reproduced
+  bit for bit.
 
 ## Status
-Complete (milestones M0 to M9; v1.0 drag surrogate, v2.0 flow-field surrogate). See `SPEC.md` for the specification and `DECISIONS.md` for every
+Complete (milestones M0 to M10; v1.0 drag surrogate, v2.0 flow-field surrogate, M10 solver and training extras). See `SPEC.md` for the specification and `DECISIONS.md` for every
 design choice and result.
 
 ## Prerequisites
@@ -212,6 +218,26 @@ Limits:
 - The largest errors are in the far wake, where faint block patterns at the U-Net's coarsest scale
   (16 cells) appear.
 - Same channel setup, shape families and Re range as the CNN.
+
+## Training extras (M10)
+The channel is mirror-symmetric and the CNN crop is centred on its centreline, so a mirrored mask is
+an exact new training case with the same Cd and opposite Cl (the U-Net: same ux and Cp, opposite uy).
+`--flip` in `scripts/train.py` and `scripts/train_fields.py` mirrors half of each batch;
+`--re-weight-bins 8` weights the loss towards the rarer high-Re cases. Test set, 3 seeds each
+(`notebooks/m10_train_cnn.ipynb`, `notebooks/m10_train_unet.ipynb`):
+
+| CNN variant | Cd MAE | Cl MAE | Cl MAE, circles | Cd rel. error, Re 80-100 | \|Cd - Cd(mirrored mask)\| |
+|---|---|---|---|---|---|
+| v1 (shipped) | 0.051 ± 0.002 | 0.060 ± 0.006 | 0.018 ± 0.009 | 2.8 % | 0.074 |
+| **flip** | **0.043 ± 0.001** | **0.044 ± 0.001** | **0.008 ± 0.002** | 2.2 % | **0.025** |
+| Re weights | 0.049 ± 0.002 | 0.052 ± 0.003 | 0.006 ± 0.003 | 2.5 % | 0.074 |
+| flip + Re weights | 0.041 ± 0.002 | 0.056 ± 0.018 | 0.024 ± 0.024 | 2.0 % | 0.024 |
+
+Flip cuts the CNN's Cd error by 16 % and its Cl error by 27 %, and the v1 CNN's answers for a shape
+and its mirror image differed by more than its test error. Adding Re weights gives the lowest Cd
+error but an unstable Cl (the best epoch is chosen on Cd only). For the U-Net, flip leaves the
+accuracy unchanged (velocity 1.95 ± 0.02 %, Cp 5.08 ± 0.07 %) and halves the mirror inconsistency
+(velocity 2.0 % -> 0.9 %). The shipped models are still the v1 ones.
 
 ## Flow Studio
 `python gui/app.py`
