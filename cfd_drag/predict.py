@@ -15,7 +15,7 @@ from .geometry import extents
 from .params import FIELD, DOMAIN, PHYSICS, SAMPLING, DomainParams, PhysicsParams, SamplingParams
 from .paths import REPO_ROOT, SOLVER_EXE
 
-MODEL_PATH = REPO_ROOT / "models" / "surrogate_v1.pt"
+MODEL_PATH = REPO_ROOT / "models" / "surrogate_v2.pt"
 # U-Net weights (31 MB) are a release asset, not tracked in git: scripts/fetch_field_model.py
 FIELD_MODEL_PATH = REPO_ROOT / "models" / "field_unet_v1.pt"
 

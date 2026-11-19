@@ -68,3 +68,15 @@ def test_unet_training_with_flip_is_deterministic(tmp_path):
     a = train_fields(df, masks, fields, tmp_path / "a", params, split, device="cpu", log=lambda *_: None)
     b = train_fields(df, masks, fields, tmp_path / "b", params, split, device="cpu", log=lambda *_: None)
     assert all(torch.equal(a["state_dict"][k], b["state_dict"][k]) for k in a["state_dict"])
+
+
+def test_auto_precision_is_float_on_cuda_double_on_cpu():
+    from cfd_drag.dataset import _config, global_args, resolve_precision
+    from cfd_drag.params import DOMAIN, PHYSICS, SAMPLING
+    assert PHYSICS.precision == "auto"
+    assert resolve_precision(PHYSICS, "cuda").precision == "float"
+    cpu = resolve_precision(PHYSICS, "cpu")
+    assert cpu.precision == "double"
+    assert "--precision" not in global_args(DOMAIN, PHYSICS) and "--precision" not in global_args(DOMAIN, cpu)
+    assert "precision" not in _config(0, "cpu", DOMAIN, cpu, SAMPLING)["physics"]  # v1 cpu configs unchanged
+    assert resolve_precision(replace(PHYSICS, precision="double"), "cuda").precision == "double"

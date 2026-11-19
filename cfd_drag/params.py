@@ -31,8 +31,9 @@ class PhysicsParams:
     avg_flowthroughs: float = 1.0     # averaging window = this * nx / u
     steady_cl_rms: float = 0.02       # Cl_rms below this -> regime "steady", else "periodic"
     walls: str = "noslip"             # channel walls: "noslip" (bounce-back) or "freeslip" (specular)
-    precision: str = "double"         # numerics, not physics: solver population storage "double" or
-                                      # "float" (stores f_i - w_i; see DECISIONS.md, M10)
+    precision: str = "auto"           # numerics, not physics: solver population storage "double",
+                                      # "float" (stores f_i - w_i; see DECISIONS.md, M10) or "auto" =
+                                      # float on the cuda back-end, double on cpu (M10, owner-approved)
 
     def warmup_steps(self, nx: int) -> int:
         return int(self.warmup_flowthroughs * nx / self.u)

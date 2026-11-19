@@ -51,8 +51,9 @@ U-Net field error for this case: velocity 3.6 %, Cp 6.8 %.*
   reflection; cylinder D = 20, Re = 40: Cd 2.84 -> 2.17), and `--precision float` stores the
   populations as float32 deviations from equilibrium weights. Float is **4x faster on a T4**
   (0.18 s instead of 0.71 s per case) and matches double to 2e-6 in Cd on steady cases and 2e-4 on
-  vortex-shedding cases. Defaults stay no-slip and double, so the published datasets are reproduced
-  bit for bit.
+  vortex-shedding cases. Default walls stay no-slip; the default precision `auto` is float on the
+  CUDA back-end and double on the CPU (the published v1/v2 datasets were made in double; pass
+  `precision="double"` to reproduce them bit for bit).
 
 ## Status
 Complete (milestones M0 to M10; v1.0 drag surrogate, v2.0 flow-field surrogate, M10 solver and training extras). See `SPEC.md` for the specification and `DECISIONS.md` for every
@@ -228,7 +229,7 @@ an exact new training case with the same Cd and opposite Cl (the U-Net: same ux 
 
 | CNN variant | Cd MAE | Cl MAE | Cl MAE, circles | Cd rel. error, Re 80-100 | \|Cd - Cd(mirrored mask)\| |
 |---|---|---|---|---|---|
-| v1 (shipped) | 0.051 ± 0.002 | 0.060 ± 0.006 | 0.018 ± 0.009 | 2.8 % | 0.074 |
+| v1 (M5) | 0.051 ± 0.002 | 0.060 ± 0.006 | 0.018 ± 0.009 | 2.8 % | 0.074 |
 | **flip** | **0.043 ± 0.001** | **0.044 ± 0.001** | **0.008 ± 0.002** | 2.2 % | **0.025** |
 | Re weights | 0.049 ± 0.002 | 0.052 ± 0.003 | 0.006 ± 0.003 | 2.5 % | 0.074 |
 | flip + Re weights | 0.041 ± 0.002 | 0.056 ± 0.018 | 0.024 ± 0.024 | 2.0 % | 0.024 |
@@ -237,7 +238,8 @@ Flip cuts the CNN's Cd error by 16 % and its Cl error by 27 %, and the v1 CNN's 
 and its mirror image differed by more than its test error. Adding Re weights gives the lowest Cd
 error but an unstable Cl (the best epoch is chosen on Cd only). For the U-Net, flip leaves the
 accuracy unchanged (velocity 1.95 ± 0.02 %, Cp 5.08 ± 0.07 %) and halves the mirror inconsistency
-(velocity 2.0 % -> 0.9 %). The shipped models are still the v1 ones.
+(velocity 2.0 % -> 0.9 %). The flip CNN (seed 0: Cd MAE 0.044, Cl MAE 0.044) ships as
+`models/surrogate_v2.pt` and replaces the v1 CNN; the U-Net stays v1.
 
 ## Flow Studio
 `python gui/app.py`
@@ -245,7 +247,7 @@ accuracy unchanged (velocity 1.95 ± 0.02 %, Cp 5.08 ± 0.07 %) and halves the m
   panel shows the frontal height D, blockage and relaxation time τ, and flags inputs the solver
   rejects (unstable τ, blockage above 25 %) or that lie outside the CNN's training range.
 * **CNN prediction (instant):** on every change the app builds the exact 64x64 mask the CNN was
-  trained on (one solver step, ~20 ms) and predicts Cd and Cl with `models/surrogate_v1.pt`.
+  trained on (one solver step, ~20 ms) and predicts Cd and Cl with `models/surrogate_v2.pt`.
 * **U-Net field (instant):** the predicted time-averaged speed, ux, uy or Cp around the obstacle
   (about 35 ms on the CPU, `models/field_unet_v1.pt`, see step 9 of the Quick Start).
 * **Run solver:** the full simulation with the dataset settings (about 40 s on a 6-core desktop CPU),

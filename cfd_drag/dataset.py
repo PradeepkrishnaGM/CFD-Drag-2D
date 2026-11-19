@@ -26,7 +26,7 @@ import subprocess
 import tempfile
 import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -51,7 +51,14 @@ def global_args(domain: DomainParams, physics: PhysicsParams, mean_fields: bool 
             "--warmup", str(physics.warmup_steps(domain.nx)),
             "--avg", str(physics.avg_steps(domain.nx)), "--dump",
             *(["--walls", physics.walls] if physics.walls != "noslip" else []),
-            *(["--precision", physics.precision] if physics.precision != "double" else [])]
+            *(["--precision", physics.precision] if physics.precision not in ("double", "auto") else [])]
+
+
+def resolve_precision(physics: PhysicsParams, backend: str) -> PhysicsParams:
+    """precision "auto" -> "float" on the cuda back-end (3.98x faster on a T4), "double" on cpu."""
+    if physics.precision != "auto":
+        return physics
+    return replace(physics, precision="float" if backend == "cuda" else "double")
 
 
 def solver_command(case: Case, out_dir: Path, domain: DomainParams, physics: PhysicsParams,
@@ -223,7 +230,7 @@ def count_gpus() -> int:
 
 
 def _config(seed: int, backend: str, domain, physics, sampling, fields=None) -> dict:
-    ph = asdict(physics)
+    ph = asdict(resolve_precision(physics, backend))
     for k, default in (("walls", "noslip"), ("precision", "double")):
         if ph[k] == default:  # keep configs of earlier datasets unchanged
             del ph[k]
@@ -248,6 +255,7 @@ def generate(out: Path, n: int, seed: int, workers: int, domain: DomainParams,
     exe = {"cpu": SOLVER_EXE, "cuda": SOLVER_CUDA_EXE}[backend]
     if not exe.exists():
         raise FileNotFoundError(f"{exe} not found; run `make {'solver' if backend == 'cpu' else 'cuda'}` first")
+    physics = resolve_precision(physics, backend)
     out = Path(out)
     (out / "samples").mkdir(parents=True, exist_ok=True)
     images_dir = out / "images" if images else None
