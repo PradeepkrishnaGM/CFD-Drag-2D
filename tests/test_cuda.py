@@ -27,7 +27,7 @@ COMMON = ["--width", "120", "--height", "40", "--warmup", "1500", "--avg", "500"
 CASES = [("circle", 4.0, 4.0, 0.0, 30.0), ("rect", 3.0, 6.0, 25.0, 45.0), ("tri", 5.0, 7.0, 60.0, 25.0)]
 
 
-def _run_batch(tmp_path, cases, name):
+def _run_batch(tmp_path, cases, name, extra=()):
     root = tmp_path / name
     root.mkdir()
     lines = ["out_dir,shape,size1,size2,angle,re"]
@@ -35,7 +35,7 @@ def _run_batch(tmp_path, cases, name):
         (root / str(i)).mkdir()
         lines.append(f"{root / str(i)},{shape},{s1},{s2},{a},{re}")
     (root / "cases.csv").write_text("\n".join(lines) + "\n")
-    proc = subprocess.run([str(SOLVER_CUDA_EXE), "--batch", str(root / "cases.csv"), *COMMON],
+    proc = subprocess.run([str(SOLVER_CUDA_EXE), "--batch", str(root / "cases.csv"), *COMMON, *extra],
                           capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     return root
@@ -76,3 +76,33 @@ def test_cuda_dataset_independent_of_batch_size(tmp_path):
     generate(tmp_path / "b2", 6, 3, 1, gpu=GpuParams(batch_size=2), **kw)
     generate(tmp_path / "b6", 6, 3, 1, gpu=GpuParams(batch_size=6), **kw)
     assert (tmp_path / "b2/data.csv").read_bytes() == (tmp_path / "b6/data.csv").read_bytes()
+
+
+def test_cuda_freeslip_matches_cpu(solver_exe, tmp_path):
+    extra = ("--walls", "freeslip")
+    root = _run_batch(tmp_path, CASES, "gpu_fs", extra)
+    for i, (shape, s1, s2, a, re) in enumerate(CASES):
+        cpu = tmp_path / f"cpu_fs{i}"
+        cpu.mkdir()
+        run_solver(solver_exe, cpu, *COMMON, *extra, "--shape", shape, "--size1", s1, "--size2", s2,
+                   "--angle", a, "--re", re)
+        g, c = read_results(root / str(i)), read_results(cpu)
+        for k in ("Cd", "Cl"):
+            assert g[k] == pytest.approx(c[k], rel=1e-6, abs=1e-9), (shape, k)
+        assert np.abs(np.load(root / str(i) / "fields_mean.npy") - np.load(cpu / "fields_mean.npy")).max() < 1e-9
+
+
+def test_cuda_float_matches_cpu_float(solver_exe, tmp_path):
+    """Float arithmetic differs slightly between GPU (fused multiply-add) and CPU: loose tolerance."""
+    extra = ("--precision", "float")
+    root = _run_batch(tmp_path, CASES, "gpu_f32", extra)
+    for i, (shape, s1, s2, a, re) in enumerate(CASES):
+        cpu = tmp_path / f"cpu_f32{i}"
+        cpu.mkdir()
+        run_solver(solver_exe, cpu, *COMMON, *extra, "--shape", shape, "--size1", s1, "--size2", s2,
+                   "--angle", a, "--re", re)
+        g, c = read_results(root / str(i)), read_results(cpu)
+        assert g["Cd"] == pytest.approx(c["Cd"], rel=1e-3), shape
+        assert abs(g["Cl"] - c["Cl"]) < 1e-3, shape
+        mg, mc = np.load(root / str(i) / "fields_mean.npy"), np.load(cpu / "fields_mean.npy")
+        assert np.abs(mg[:2] - mc[:2]).max() < 1e-4

@@ -25,8 +25,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=FIELD_TRAIN.epochs)
     ap.add_argument("--device", default="auto", help="auto, cpu or cuda")
     ap.add_argument("--seed", type=int, default=FIELD_TRAIN.seed, help="weight init and batch order (split stays fixed)")
+    ap.add_argument("--flip", action="store_true", help="M10: mirror augmentation (uy -> -uy)")
     args = ap.parse_args()
-    params = replace(FIELD_TRAIN, epochs=args.epochs, seed=args.seed)
+    params = replace(FIELD_TRAIN, epochs=args.epochs, seed=args.seed,
+                     augment_flip=args.flip or FIELD_TRAIN.augment_flip)
     df, masks, fields = load_field_dataset(args.data)
     ckpt = train_fields(df, masks, fields, args.out, params, device=args.device)
     print(f"best epoch {ckpt['best_epoch']}, val error {ckpt['best_val_error']:.4f}, "

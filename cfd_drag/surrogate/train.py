@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from ..params import TRAIN, TrainParams
-from .data import TARGETS, Normaliser, split_indices
+from .data import TARGETS, Normaliser, flip_y_std, re_weights, split_indices
 from .model import SurrogateCNN
 
 
@@ -60,6 +60,10 @@ def train(df: pd.DataFrame, masks: np.ndarray, out_dir: Path, params: TrainParam
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=params.epochs)
     w = torch.tensor([params.loss_weight_cd, params.loss_weight_cl], device=dev)
     gen = torch.Generator().manual_seed(params.seed)
+    sw_tr = None
+    if params.re_weight_bins > 0:
+        sw_tr = torch.as_tensor(re_weights(tr["re"].to_numpy(float), params.re_weight_bins,
+                                           params.re_weight_max).astype(np.float32), device=dev)
 
     best, best_state, history = float("inf"), None, []
     t0 = time.time()
@@ -71,7 +75,14 @@ def train(df: pd.DataFrame, masks: np.ndarray, out_dir: Path, params: TrainParam
             b = perm[i:i + params.batch_size]
             if len(b) < 2:  # BatchNorm needs more than one sample
                 continue
-            loss = (((model(x_tr[b], re_tr[b]) - y_tr[b]) ** 2) * w).mean()
+            xb, yb = x_tr[b], y_tr[b]
+            if params.augment_flip:  # mirror about the channel centreline: Cd kept, Cl -> -Cl
+                flip = (torch.rand(len(b), generator=gen) < 0.5).to(dev)
+                xb = torch.where(flip[:, None, None, None], xb.flip(-2), xb)
+                yb = torch.stack([yb[:, 0], torch.where(flip, flip_y_std(yb[:, 1], norm.y_mean[1], norm.y_std[1]),
+                                                        yb[:, 1])], dim=1)
+            sq = ((model(xb, re_tr[b]) - yb) ** 2) * w
+            loss = (sq.mean(dim=1) * sw_tr[b]).mean() if sw_tr is not None else sq.mean()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()

@@ -59,6 +59,10 @@ def main():
     metrics = {"cnn": report(test, pred), **run_baselines(df, split, params),
                "best_epoch": ckpt["best_epoch"], "train_seconds": ckpt["train_seconds"],
                "device": ckpt["device"]}
+    # Mirror symmetry (M10): the mirrored mask must give the same Cd and the opposite Cl
+    pred_flip = predict_df(model, norm, test, masks[split["test"]][:, ::-1].copy())
+    metrics["flip_consistency"] = {"Cd_mae": float(abs(pred_flip[:, 0] - pred[:, 0]).mean()),
+                                   "Cl_mae": float(abs(pred_flip[:, 1] + pred[:, 1]).mean())}
     cd = {k: metrics[k]["all"]["Cd_mae"] for k in ["cnn", "gbm", "mean"]}
     metrics["passed"] = cd["cnn"] < cd["gbm"] and cd["cnn"] < cd["mean"]
     (args.run / "metrics.json").write_text(json.dumps(metrics, indent=1))
@@ -71,6 +75,8 @@ def main():
     for k in ["mean", "gbm", "cnn"]:
         a = metrics[k]["all"]
         print(f"{k:14s} {a['Cd_mae']:8.4f} {a['Cd_r2']:7.3f} {a['Cd_rel_mean']:7.2%} {a['Cl_mae']:8.4f} {a['Cl_r2']:7.3f}")
+    fc = metrics["flip_consistency"]
+    print(f"mirror consistency: |Cd - Cd_mirror| {fc['Cd_mae']:.4f}, |Cl + Cl_mirror| {fc['Cl_mae']:.4f}")
     print("PASSED: CNN beats both baselines on test Cd MAE" if metrics["passed"]
           else "FAILED: CNN does not beat both baselines on test Cd MAE")
     sys.exit(0 if metrics["passed"] else 1)

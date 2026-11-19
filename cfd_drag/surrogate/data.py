@@ -44,6 +44,24 @@ class Normaliser:
         return np.asarray(y_std) * self.y_std + self.y_mean
 
 
+def re_weights(re: np.ndarray, bins: int, w_max: float) -> np.ndarray:
+    """Per-sample weights ~ 1 / (count of samples in the same equal-width Re bin), mean 1.
+
+    Rare (mostly high) Re values get more weight; weights are capped at w_max and renormalised.
+    """
+    re = np.asarray(re, float)
+    edges = np.linspace(re.min(), re.max(), bins + 1)
+    idx = np.clip(np.searchsorted(edges, re, side="right") - 1, 0, bins - 1)
+    w = 1.0 / np.bincount(idx, minlength=bins)[idx]
+    w = np.minimum(w / w.mean(), w_max)
+    return w / w.mean()
+
+
+def flip_y_std(y_std, mean: float, std: float):
+    """Standardised value of -v given the standardised value of v: -(y) - 2 mean / std."""
+    return -y_std - 2.0 * mean / std
+
+
 def tabular_features(df: pd.DataFrame) -> np.ndarray:
     """Shape parameters for the gradient-boosting baseline.
 

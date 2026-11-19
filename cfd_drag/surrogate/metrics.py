@@ -4,6 +4,8 @@ import pandas as pd
 
 from .data import TARGETS
 
+RE_BANDS = (20, 40, 60, 80, 100)  # Re breakdown edges (M10); the last band includes 100
+
 
 def regression(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     """MAE and R² for Cd and Cl; relative error for Cd only (Cl is often ~0)."""
@@ -23,7 +25,7 @@ def regression(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 
 def report(df: pd.DataFrame, y_pred: np.ndarray) -> dict:
-    """Overall metrics plus breakdowns by shape and by status (steady/periodic)."""
+    """Overall metrics plus breakdowns by shape, status (steady/periodic) and Re band."""
     y_true = df[TARGETS].to_numpy(float)
     res = {"all": regression(y_true, y_pred)}
     for col in ["shape", "status"]:
@@ -31,4 +33,9 @@ def report(df: pd.DataFrame, y_pred: np.ndarray) -> dict:
             m = (df[col] == value).to_numpy()
             if m.sum() >= 2:
                 res[f"{col}={value}"] = regression(y_true[m], y_pred[m])
+    re = df["re"].to_numpy(float)
+    for lo, hi in zip(RE_BANDS[:-1], RE_BANDS[1:]):
+        m = (re >= lo) & ((re < hi) | ((hi == RE_BANDS[-1]) & (re <= hi)))
+        if m.sum() >= 2:
+            res[f"re={lo}-{hi}"] = regression(y_true[m], y_pred[m])
     return res

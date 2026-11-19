@@ -26,8 +26,12 @@ def main():
     ap.add_argument("--epochs", type=int, default=TRAIN.epochs)
     ap.add_argument("--device", default="auto", help="auto, cpu or cuda")
     ap.add_argument("--seed", type=int, default=TRAIN.seed, help="weight init and batch order (split stays fixed)")
+    ap.add_argument("--flip", action="store_true", help="M10: mirror augmentation (Cl -> -Cl)")
+    ap.add_argument("--re-weight-bins", type=int, default=TRAIN.re_weight_bins,
+                    help="M10: >0 weights samples by inverse Re-bin frequency")
     args = ap.parse_args()
-    params = replace(TRAIN, epochs=args.epochs, seed=args.seed)
+    params = replace(TRAIN, epochs=args.epochs, seed=args.seed, augment_flip=args.flip or TRAIN.augment_flip,
+                     re_weight_bins=args.re_weight_bins)
     df, masks = load(args.data)
     args.out.mkdir(parents=True, exist_ok=True)
     split = split_indices(len(df), params)

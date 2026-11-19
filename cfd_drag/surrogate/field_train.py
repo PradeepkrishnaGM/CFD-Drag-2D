@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from ..params import FIELD_TRAIN, TRAIN, FieldTrainParams, TrainParams
-from .data import split_indices
+from .data import flip_y_std, split_indices
 from .fields import FieldNormaliser, make_inputs
 from .train import pick_device
 from .unet import FieldUNet, n_parameters
@@ -90,9 +90,17 @@ def train_fields(df: pd.DataFrame, masks: np.ndarray, fields: np.ndarray, out_di
             b = perm[i:i + params.batch_size]
             if len(b) < 2:  # BatchNorm needs more than one sample
                 continue
+            xb, yb, fb = x_tr[b].float(), y_tr[b].float(), f_tr[b]
+            if params.augment_flip:  # mirror about the channel centreline: uy -> -uy
+                flip = (torch.rand(len(b), generator=gen) < 0.5).to(dev)
+                xb = torch.where(flip[:, None, None, None], xb.flip(-2), xb)
+                fb = torch.where(flip[:, None, None], fb.flip(-2), fb)
+                yf = yb.flip(-2)
+                yf = torch.cat([yf[:, :1], flip_y_std(yf[:, 1:2], norm.mean[1], norm.std[1]), yf[:, 2:]], dim=1)
+                yb = torch.where(flip[:, None, None, None], yf, yb)
             with torch.autocast(dev.type, dtype=torch.float16, enabled=amp):
-                pred = model(x_tr[b].float())
-            loss = _masked_mse(pred.float(), y_tr[b].float(), f_tr[b], w)
+                pred = model(xb)
+            loss = _masked_mse(pred.float(), yb, fb, w)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)

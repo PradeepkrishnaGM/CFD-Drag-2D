@@ -30,6 +30,9 @@ class PhysicsParams:
     warmup_flowthroughs: float = 2.0  # steps before averaging = this * nx / u
     avg_flowthroughs: float = 1.0     # averaging window = this * nx / u
     steady_cl_rms: float = 0.02       # Cl_rms below this -> regime "steady", else "periodic"
+    walls: str = "noslip"             # channel walls: "noslip" (bounce-back) or "freeslip" (specular)
+    precision: str = "double"         # numerics, not physics: solver population storage "double" or
+                                      # "float" (stores f_i - w_i; see DECISIONS.md, M10)
 
     def warmup_steps(self, nx: int) -> int:
         return int(self.warmup_flowthroughs * nx / self.u)
@@ -95,6 +98,11 @@ class TrainParams:
     batch_size: int = 128
     epochs: int = 150                       # best epoch by validation Cd MAE is kept
     seed: int = 0                           # weight init and batch order
+    augment_flip: bool = False              # M10: random mirror about the channel centreline
+                                            # (exact symmetry: Cd kept, Cl -> -Cl), p = 0.5 per sample
+    re_weight_bins: int = 0                 # M10: >0 weights training samples by inverse frequency
+                                            # of their Re bin (equal-width bins), mean weight 1
+    re_weight_max: float = 5.0              # cap on a sample weight before renormalising
     gbm_max_iter: int = 500                 # gradient-boosting baseline
     gbm_learning_rate: float = 0.05
 
@@ -112,6 +120,7 @@ class FieldTrainParams:
     epochs: int = 100                       # best epoch by validation error is kept
     seed: int = 0                           # weight init and batch order
     amp: bool = True                        # float16 mixed precision on CUDA (ignored on CPU)
+    augment_flip: bool = False              # M10: random mirror about the channel centreline (uy -> -uy)
 
 
 DOMAIN = DomainParams()

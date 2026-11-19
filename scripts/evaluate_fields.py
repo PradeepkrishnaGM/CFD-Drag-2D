@@ -74,6 +74,11 @@ def main():
     metrics = {k: summarise(e, test) for k, e in errs.items()}
     metrics.update(best_epoch=ckpt["best_epoch"], train_seconds=ckpt["train_seconds"],
                    device=ckpt["device"], n_parameters=ckpt["n_parameters"])
+    # Mirror symmetry (M10): prediction for the mirrored mask, mirrored back with uy -> -uy
+    pf = predict_fields(model, norm, params, m_te[:, ::-1].copy(), test["re"].to_numpy(float))[:, :, ::-1]
+    pf[:, 1] *= -1
+    mc = field_errors(pred, pf, m_te, wake_x0)
+    metrics["flip_consistency"] = {"u_rel_l2": float(mc["u_rel_l2"].mean()), "cp_rel_l2": float(mc["cp_rel_l2"].mean())}
     a = {k: metrics[k]["all"] for k in preds}
     metrics["passed"] = all(a["unet"][c] < a[b][c] for b in ("mean", "nearest") for c in ("u_rel_l2", "cp_rel_l2"))
     (args.run / "metrics.json").write_text(json.dumps(metrics, indent=1))
@@ -89,6 +94,8 @@ def main():
         r = a[k]
         print(f"{k:14s} {r['u_rel_l2']:8.2%} {r['cp_rel_l2']:9.2%} {r['u_rel_l2_wake']:8.2%} "
               f"{r['cp_rel_l2_wake']:8.2%} {r['u_mae']:7.4f} {r['cp_mae']:7.4f}")
+    fc = metrics["flip_consistency"]
+    print(f"mirror consistency (rel. L2 between prediction and mirrored prediction): u {fc['u_rel_l2']:.2%}, Cp {fc['cp_rel_l2']:.2%}")
     print("PASSED: U-Net beats both baselines on velocity and Cp errors" if metrics["passed"]
           else "FAILED: U-Net does not beat both baselines")
     sys.exit(0 if metrics["passed"] else 1)

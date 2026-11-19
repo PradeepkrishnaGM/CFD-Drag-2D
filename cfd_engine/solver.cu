@@ -5,7 +5,9 @@
  *
  * Usage: solver_cuda --batch cases.csv [global options as for the CPU solver]
  *   cases.csv columns: out_dir,shape,size1,size2,angle,re   (header line required)
- *   All cases share the global options (domain, U, inlet, warmup, avg, guards, --dump, --mean-fields).
+ *   All cases share the global options (domain, U, inlet, walls, precision, warmup, avg, guards,
+ *   --dump, --mean-fields). --precision float stores populations as float deviations f_i - w_i
+ *   (half the memory traffic, single-precision arithmetic); default double.
  *   Each case writes the same files as the CPU solver into its out_dir; a case rejected
  *   by the guards writes rejected.txt instead.
  *
@@ -34,9 +36,10 @@ static void cuda_check(cudaError_t e, const char* what, int line) {
 constexpr int BLOCK_X = 128;    // threads per block along x in the step kernel
 constexpr int FORCE_BLOCK = 256;  // threads per block in the force reduction
 
+template <typename T>
 __global__ void step_kernel(StepParams base, size_t N, const double* om_p, const double* om_m,
                             const uint8_t* cell, const uint8_t* interior, const double* u_in,
-                            const double* A, double* B, double* fnode, int store, double* rho,
+                            const T* A, T* B, double* fnode, int store, double* rho,
                             double* ux, double* uy, double* mean) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
     const size_t c = blockIdx.z;
@@ -96,6 +99,9 @@ static std::vector<std::string> split_csv(const std::string& line) {
     return out;
 }
 
+template <typename T>
+static int run_batch(const Config& base, std::vector<HostCase>& cases, int n_rejected);
+
 int main(int argc, char** argv) {
     Config base;
     try {
@@ -150,6 +156,13 @@ int main(int argc, char** argv) {
         std::cout << "No valid cases (" << n_rejected << " rejected)\n";
         return 0;
     }
+    return base.precision == "float" ? run_batch<float>(base, cases, n_rejected)
+                                     : run_batch<double>(base, cases, n_rejected);
+}
+
+// Simulate all valid cases; T is the population storage type (--precision).
+template <typename T>
+static int run_batch(const Config& base, std::vector<HostCase>& cases, int n_rejected) {
     const Config& c0 = cases[0].cfg;  // shared settings (identical for all cases)
     const int nx = c0.nx, ny = c0.ny, C = (int)cases.size();
     const size_t N = (size_t)nx * ny;
@@ -159,15 +172,16 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> h_cell(C * N), h_interior(C * N);
     std::vector<double> h_omp(C), h_omm(C);
     std::vector<int> h_fstart(C), h_fcount(C), h_fidx;
-    std::vector<double> h_A(9 * N);
+    std::vector<T> h_A(9 * N);
     std::vector<double> mass0(C);
 
-    double *d_A, *d_B, *d_fnode, *d_rho, *d_ux, *d_uy, *d_uin, *d_omp, *d_omm, *d_mean = nullptr;
+    T *d_A, *d_B;
+    double *d_fnode, *d_rho, *d_ux, *d_uy, *d_uin, *d_omp, *d_omm, *d_mean = nullptr;
     uint8_t *d_cell, *d_interior;
     int *d_fstart, *d_fcount, *d_fidx;
     ForceStats* d_stats;
-    CK(cudaMalloc(&d_A, 9 * N * C * sizeof(double)));
-    CK(cudaMalloc(&d_B, 9 * N * C * sizeof(double)));
+    CK(cudaMalloc(&d_A, 9 * N * C * sizeof(T)));
+    CK(cudaMalloc(&d_B, 9 * N * C * sizeof(T)));
     CK(cudaMalloc(&d_fnode, 2 * N * C * sizeof(double)));
     CK(cudaMalloc(&d_rho, N * C * sizeof(double)));
     CK(cudaMalloc(&d_ux, N * C * sizeof(double)));
@@ -200,7 +214,7 @@ int main(int argc, char** argv) {
         h_fidx.insert(h_fidx.end(), hc.geo.force_nodes.begin(), hc.geo.force_nodes.end());
         init_populations(hc.cfg, hc.geo, h_A.data());
         mass0[c] = fluid_mass(hc.geo, h_A.data());
-        CK(cudaMemcpy(d_A + c * 9 * N, h_A.data(), 9 * N * sizeof(double), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_A + c * 9 * N, h_A.data(), 9 * N * sizeof(T), cudaMemcpyHostToDevice));
         hc.geo.interior.clear();  // no longer needed on the host
         hc.geo.interior.shrink_to_fit();
     }
@@ -223,7 +237,7 @@ int main(int argc, char** argv) {
     cudaDeviceProp prop;
     CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&prop, dev));
-    std::cout << "CUDA LBM | " << prop.name << " | " << C << " cases (" << n_rejected << " rejected) | "
+    std::cout << "CUDA LBM (" << base.precision << ") | " << prop.name << " | " << C << " cases (" << n_rejected << " rejected) | "
               << nx << "x" << ny << " | " << total << " steps\n";
 
     // ---- Time loop ----------------------------------------------------------------------
@@ -232,7 +246,7 @@ int main(int argc, char** argv) {
     for (int step = 0; step < total; ++step) {
         base_params.ramp = c0.box ? 1.0 : ramp_factor(step, c0.ramp);
         const int store = step == total - 1;
-        step_kernel<<<grid, block>>>(base_params, N, d_omp, d_omm, d_cell, d_interior, d_uin, d_A, d_B,
+        step_kernel<T><<<grid, block>>>(base_params, N, d_omp, d_omm, d_cell, d_interior, d_uin, d_A, d_B,
                                      d_fnode, store, d_rho, d_ux, d_uy, step >= c0.warmup ? d_mean : nullptr);
         force_kernel<<<C, FORCE_BLOCK>>>(N, d_fstart, d_fcount, d_fidx, d_fnode, d_stats, step,
                                          c0.warmup, c0.avg);
@@ -257,7 +271,7 @@ int main(int argc, char** argv) {
     if (d_mean) f.mean.resize(3 * N);
     int n_diverged = 0;
     for (int c = 0; c < C; ++c) {
-        CK(cudaMemcpy(h_A.data(), d_A + c * 9 * N, 9 * N * sizeof(double), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(h_A.data(), d_A + c * 9 * N, 9 * N * sizeof(T), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(f.rho.data(), d_rho + c * N, N * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(f.ux.data(), d_ux + c * N, N * sizeof(double), cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(f.uy.data(), d_uy + c * N, N * sizeof(double), cudaMemcpyDeviceToHost));

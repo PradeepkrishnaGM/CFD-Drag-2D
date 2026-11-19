@@ -1,7 +1,8 @@
 /**
  * Shared core of the CPU (solver.cpp) and CUDA (solver.cu) LBM solvers.
  *
- * Model: D2Q9 lattice Boltzmann, TRT collision, half-way bounce-back, Zou-He velocity
+ * Model: D2Q9 lattice Boltzmann, TRT collision, half-way bounce-back (optional free-slip
+ * channel walls), Zou-He velocity
  * inlet and pressure outlet. Conventions (lattice units, dx = dt = 1, reference density 1):
  *  - Rows y = 0 and y = ny-1 are wall nodes; with half-way bounce-back the effective
  *    walls sit at y = 0.5 and y = ny - 1.5, so the fluid channel width is H = ny - 2.
@@ -27,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef __CUDACC__
@@ -59,6 +61,8 @@ struct Config {
     double re = 100.0;
     double u = 0.05;               // mean inlet velocity
     std::string inlet = "uniform"; // uniform | parabolic
+    std::string walls = "noslip";  // channel walls: noslip (bounce-back) | freeslip (specular reflection)
+    std::string precision = "double";  // population storage: double | float (stores f_i - w_i)
     double cx = -1.0, cy = -1.0;   // obstacle centre; default (nx/4, ny/2)
     int warmup = -1;               // steps before averaging; default 2 flow-throughs
     int avg = -1;                  // averaging steps; default 1 flow-through
@@ -93,6 +97,8 @@ inline void parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "--re") cfg.re = std::stod(next());
         else if (a == "--u" || a == "--velocity") cfg.u = std::stod(next());
         else if (a == "--inlet") cfg.inlet = next();
+        else if (a == "--walls") cfg.walls = next();
+        else if (a == "--precision") cfg.precision = next();
         else if (a == "--cx") cfg.cx = std::stod(next());
         else if (a == "--cy") cfg.cy = std::stod(next());
         else if (a == "--warmup") cfg.warmup = std::stoi(next());
@@ -151,6 +157,8 @@ inline std::string validate(const Config& c) {
     if (c.shape != "circle" && c.shape != "rect" && c.shape != "tri" && c.shape != "none")
         return "unknown shape " + c.shape;
     if (c.inlet != "uniform" && c.inlet != "parabolic") return "unknown inlet " + c.inlet;
+    if (c.walls != "noslip" && c.walls != "freeslip") return "unknown walls " + c.walls;
+    if (c.precision != "double" && c.precision != "float") return "unknown precision " + c.precision;
     if (c.nx < 8 || c.ny < 5 || c.re <= 0 || c.u <= 0) return "non-positive size, Re or U";
     double tau = tau_of(c), blockage = frontal_height(c) / (c.ny - 2.0);
     if (tau < c.min_tau) return "tau " + std::to_string(tau) + " < min_tau";
@@ -244,19 +252,27 @@ inline Geometry build_geometry(const Config& c) {
 // Initial post-collision populations (structure-of-arrays, f[i * N + k]). Equilibrium is
 // unchanged by collision, so it is a valid post-collision state. The open channel starts
 // at rest (the inlet ramps up); the closed box starts with the inlet velocity everywhere.
-inline void init_populations(const Config& c, const Geometry& g, double* f) {
+// Float storage holds the deviation f_i - w_i (see node_update).
+template <typename T>
+inline void init_populations(const Config& c, const Geometry& g, T* f) {
     for (int k = 0; k < g.N; ++k) {
         int y = k / g.nx;
         double u = (c.box && g.cell[k] == FLUID) ? g.u_in[y] : 0.0;
-        for (int i = 0; i < 9; ++i) f[i * g.N + k] = equilibrium(i, 1.0, u, 0.0, W[i], CX[i], CY[i]);
+        for (int i = 0; i < 9; ++i) {
+            const double feq = equilibrium(i, 1.0, u, 0.0, W[i], CX[i], CY[i]);
+            f[i * g.N + k] = std::is_same<T, double>::value ? (T)feq : (T)(feq - W[i]);
+        }
     }
 }
 
-inline double fluid_mass(const Geometry& g, const double* f) {
+template <typename T>
+inline double fluid_mass(const Geometry& g, const T* f) {
     double m = 0.0;
     for (int k = 0; k < g.N; ++k)
-        if (g.cell[k] == FLUID)
+        if (g.cell[k] == FLUID) {
+            if (!std::is_same<T, double>::value) m += 1.0;  // sum of the weights
             for (int i = 0; i < 9; ++i) m += f[i * g.N + k];
+        }
     return m;
 }
 
@@ -266,6 +282,7 @@ inline double fluid_mass(const Geometry& g, const double* f) {
 struct StepParams {
     int nx, ny, N;
     int box;
+    int freeslip;       // 1: specular reflection at the channel walls (rows 0 and ny-1)
     double om_p, om_m;  // TRT relaxation rates
     double ramp;        // inlet ramp factor for this step, in [0, 1]
     int off[9];
@@ -277,6 +294,7 @@ inline StepParams make_step_params(const Config& c, const Geometry& g, double ta
     p.ny = c.ny;
     p.N = g.N;
     p.box = c.box;
+    p.freeslip = c.walls == "freeslip";
     // TRT: symmetric part relaxes with tau (sets viscosity), antisymmetric part with
     // tau_minus chosen so that (tau - 1/2)(tau_minus - 1/2) = TRT_LAMBDA.
     p.om_p = 1.0 / tau;
@@ -297,21 +315,34 @@ inline double ramp_factor(int n, int ramp) {
  * momentum-exchange force on the obstacle to (fx, fy). If rho is non-null, stores the
  * macroscopic fields. If acc is non-null, adds (ux, uy, rho) to acc[k], acc[N + k], acc[2N + k]
  * (running sums for the time-averaged fields). Non-fluid and wall-row nodes are left untouched.
+ *
+ * T = double: populations f_i, all arithmetic in double (the reference path).
+ * T = float: populations are stored and updated as deviations f_i - w_i in single precision,
+ * which keeps the significant digits for the small flow perturbations (rho - 1 = sum of the
+ * deviations; the Zou-He weight sums are exactly 1, so the boundary formulas keep their form).
+ *
+ * Channel walls: half-way bounce-back (no-slip), or with p.freeslip specular reflection: a
+ * population arriving from a wall row in direction i left the neighbour in the same row in the
+ * mirrored direction (cy flipped), so tangential momentum is kept and mass is conserved.
  */
+template <typename T>
 LBM_HD inline void node_update(int x, int y, const StepParams& p, const uint8_t* cell,
                                const uint8_t* interior, const double* u_in,
-                               const double* __restrict__ a, double* __restrict__ b,
+                               const T* __restrict__ a, T* __restrict__ b,
                                double& fx, double& fy, double* rho, double* ux, double* uy,
                                double* acc = nullptr) {
+    using R = T;
+    constexpr bool DEV = !std::is_same<T, double>::value;  // deviation storage f_i - w_i
     constexpr int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
     constexpr int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
     constexpr int opp[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
+    constexpr int mir[9] = {0, 1, 4, 3, 2, 8, 7, 6, 5};  // cy -> -cy
     constexpr double w[9] = {4.0 / 9.0,  1.0 / 9.0,  1.0 / 9.0,  1.0 / 9.0, 1.0 / 9.0,
                              1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0};
     const int N = p.N, k = y * p.nx + x;
     if (y == 0 || y == p.ny - 1 || cell[k] != FLUID) return;
 
-    double g[9];
+    R g[9];
     if (interior[k]) {
 LBM_UNROLL
         for (int i = 0; i < 9; ++i) g[i] = a[i * N + k + p.off[i]];
@@ -319,54 +350,77 @@ LBM_UNROLL
 LBM_UNROLL
         for (int i = 0; i < 9; ++i) {
             const int sx = x - cx[i], sy = y - cy[i];
-            if (sx < 0 || sx >= p.nx) { g[i] = 0.0; continue; }  // set by Zou-He below
+            if (sx < 0 || sx >= p.nx) { g[i] = R(0); continue; }  // set by Zou-He below
             const int ks = sy * p.nx + sx;
             if (cell[ks] == FLUID) {
                 g[i] = a[i * N + ks];
-            } else {  // half-way bounce-back
-                const double v = a[opp[i] * N + k];
-                g[i] = v;
-                if (cell[ks] == OBSTACLE) {
-                    fx += 2.0 * cx[opp[i]] * v;
-                    fy += 2.0 * cy[opp[i]] * v;
+                continue;
+            }
+            if (p.freeslip && cell[ks] == WALL && (sy == 0 || sy == p.ny - 1)) {
+                const int km = y * p.nx + sx;  // same row: mirrored path off the wall
+                if (cell[km] == FLUID) {
+                    g[i] = a[mir[i] * N + km];
+                    continue;
                 }
+            }
+            // half-way bounce-back
+            const R v = a[opp[i] * N + k];
+            g[i] = v;
+            if (cell[ks] == OBSTACLE) {
+                const double vf = DEV ? (double)v + w[i] : (double)v;
+                fx += 2.0 * cx[opp[i]] * vf;
+                fy += 2.0 * cy[opp[i]] * vf;
             }
         }
         if (!p.box && x == 0) {  // Zou-He velocity inlet: unknown 1, 5, 8
-            const double u = p.ramp * u_in[y];
-            const double r = (g[0] + g[2] + g[4] + 2.0 * (g[3] + g[6] + g[7])) / (1.0 - u);
-            const double d = 0.5 * (g[2] - g[4]);
-            g[1] = g[3] + (2.0 / 3.0) * r * u;
-            g[5] = g[7] - d + (1.0 / 6.0) * r * u;
-            g[8] = g[6] + d + (1.0 / 6.0) * r * u;
+            const R u = (R)(p.ramp * u_in[y]);
+            const R s = g[0] + g[2] + g[4] + R(2.0) * (g[3] + g[6] + g[7]);
+            const R r = (DEV ? R(1.0) + s : s) / (R(1.0) - u);
+            const R d = R(0.5) * (g[2] - g[4]);
+            g[1] = g[3] + R(2.0 / 3.0) * r * u;
+            g[5] = g[7] - d + R(1.0 / 6.0) * r * u;
+            g[8] = g[6] + d + R(1.0 / 6.0) * r * u;
         }
         if (!p.box && x == p.nx - 1) {  // Zou-He pressure outlet (rho = 1): unknown 3, 6, 7
-            const double u = -1.0 + g[0] + g[2] + g[4] + 2.0 * (g[1] + g[5] + g[8]);
-            const double d = 0.5 * (g[2] - g[4]);
-            g[3] = g[1] - (2.0 / 3.0) * u;
-            g[6] = g[8] - d - (1.0 / 6.0) * u;
-            g[7] = g[5] + d - (1.0 / 6.0) * u;
+            // (summation order kept from the double-only version: bit-identical results)
+            const R u = DEV ? g[0] + g[2] + g[4] + R(2.0) * (g[1] + g[5] + g[8])
+                            : R(-1.0) + g[0] + g[2] + g[4] + R(2.0) * (g[1] + g[5] + g[8]);
+            const R d = R(0.5) * (g[2] - g[4]);
+            g[3] = g[1] - R(2.0 / 3.0) * u;
+            g[6] = g[8] - d - R(1.0 / 6.0) * u;
+            g[7] = g[5] + d - R(1.0 / 6.0) * u;
         }
     }
 
-    double r = 0.0;
+    R rs = R(0);
 LBM_UNROLL
-    for (int i = 0; i < 9; ++i) r += g[i];
-    const double u_x = (g[1] - g[3] + g[5] - g[6] - g[7] + g[8]) / r;
-    const double u_y = (g[2] - g[4] + g[5] + g[6] - g[7] - g[8]) / r;
+    for (int i = 0; i < 9; ++i) rs += g[i];
+    const R r = DEV ? R(1.0) + rs : rs;
+    const R u_x = (g[1] - g[3] + g[5] - g[6] - g[7] + g[8]) / r;
+    const R u_y = (g[2] - g[4] + g[5] + g[6] - g[7] - g[8]) / r;
     if (rho) { rho[k] = r; ux[k] = u_x; uy[k] = u_y; }
     if (acc) { acc[k] += u_x; acc[N + k] += u_y; acc[2 * N + k] += r; }
 
-    double feq[9];
+    R feq[9];
+    if (DEV) {  // f_eq,i - w_i = w_i (rho - 1 + rho (3 cu + 4.5 cu^2 - 1.5 u^2))
+        const R u2 = u_x * u_x + u_y * u_y;
 LBM_UNROLL
-    for (int i = 0; i < 9; ++i) feq[i] = equilibrium(i, r, u_x, u_y, w[i], cx[i], cy[i]);
-    b[k] = g[0] - p.om_p * (g[0] - feq[0]);
+        for (int i = 0; i < 9; ++i) {
+            const R cu = R(cx[i]) * u_x + R(cy[i]) * u_y;
+            feq[i] = R(w[i]) * (rs + r * (R(3.0) * cu + R(4.5) * cu * cu - R(1.5) * u2));
+        }
+    } else {
+LBM_UNROLL
+        for (int i = 0; i < 9; ++i) feq[i] = (R)equilibrium(i, r, u_x, u_y, w[i], cx[i], cy[i]);
+    }
+    const R om_p = (R)p.om_p, om_m = (R)p.om_m;
+    b[k] = g[0] - om_p * (g[0] - feq[0]);
     constexpr int pair_lo[4] = {1, 2, 5, 6};  // opposite pairs (1,3), (2,4), (5,7), (6,8)
 LBM_UNROLL
     for (int q = 0; q < 4; ++q) {
         const int i = pair_lo[q], j = i + 2;
-        const double sp = p.om_p * 0.5 * ((g[i] + g[j]) - (feq[i] + feq[j]));
-        const double sm = p.om_m * 0.5 * ((g[i] - g[j]) - (feq[i] - feq[j]));
+        const R sp = om_p * R(0.5) * ((g[i] + g[j]) - (feq[i] + feq[j]));
+        const R sm = om_m * R(0.5) * ((g[i] - g[j]) - (feq[i] - feq[j]));
         b[i * N + k] = g[i] - sp - sm;
         b[j * N + k] = g[j] - sp + sm;
     }

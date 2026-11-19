@@ -1,5 +1,6 @@
 /**
  * CPU LBM solver: one case per run. Physics and I/O live in lbm_common.hpp.
+ * --precision float stores populations as float deviations (f_i - w_i); default double.
  * Build with: make solver  (from the repo root; output: build/solver)
  *
  * Exit codes: 0 ok, 2 invalid configuration (rejected before running), 3 diverged.
@@ -13,25 +14,10 @@ static int fail(const std::string& msg) {
     return 2;
 }
 
-int main(int argc, char** argv) {
-    Config cfg;
-    try {
-        parse_args(argc, argv, cfg);
-    } catch (const std::exception& e) {
-        return fail(e.what());
-    }
-    if (!cfg.batch.empty()) return fail("--batch is only supported by the CUDA solver");
-    std::string err = validate(cfg);
-    if (!err.empty()) return fail(err);
-    finalize(cfg);
-
-    const double tau = tau_of(cfg);
-    std::cout << "LBM D2Q9 | domain " << cfg.nx << "x" << cfg.ny << " | " << cfg.shape << " | Re "
-              << cfg.re << " | U " << cfg.u << " | D " << frontal_height(cfg) << " | tau " << tau
-              << " | blockage " << frontal_height(cfg) / (cfg.ny - 2.0) << "\n";
-
+template <typename T>
+static int run(const Config& cfg, double tau) {
     Geometry g = build_geometry(cfg);
-    std::vector<double> A(9 * g.N), B(9 * g.N);
+    std::vector<T> A(9 * g.N), B(9 * g.N);
     init_populations(cfg, g, A.data());
     Fields f;
     f.rho.assign(g.N, 1.0);
@@ -64,4 +50,24 @@ int main(int argc, char** argv) {
     std::cout << "\n";
     std::string status = write_outputs(cfg, g, f, stats, mass0, fluid_mass(g, A.data()), diverged);
     return status == "diverged" ? 3 : 0;
+}
+
+int main(int argc, char** argv) {
+    Config cfg;
+    try {
+        parse_args(argc, argv, cfg);
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    }
+    if (!cfg.batch.empty()) return fail("--batch is only supported by the CUDA solver");
+    std::string err = validate(cfg);
+    if (!err.empty()) return fail(err);
+    finalize(cfg);
+
+    const double tau = tau_of(cfg);
+    std::cout << "LBM D2Q9 | domain " << cfg.nx << "x" << cfg.ny << " | " << cfg.shape << " | Re "
+              << cfg.re << " | U " << cfg.u << " | D " << frontal_height(cfg) << " | tau " << tau
+              << " | blockage " << frontal_height(cfg) / (cfg.ny - 2.0) << "\n";
+
+    return cfg.precision == "float" ? run<float>(cfg, tau) : run<double>(cfg, tau);
 }

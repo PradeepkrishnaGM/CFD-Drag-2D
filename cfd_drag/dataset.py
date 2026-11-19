@@ -49,7 +49,9 @@ def global_args(domain: DomainParams, physics: PhysicsParams, mean_fields: bool 
             "--min-tau", repr(physics.min_tau), "--max-blockage", repr(physics.max_blockage),
             "--steady-cl-rms", repr(physics.steady_cl_rms),
             "--warmup", str(physics.warmup_steps(domain.nx)),
-            "--avg", str(physics.avg_steps(domain.nx)), "--dump"]
+            "--avg", str(physics.avg_steps(domain.nx)), "--dump",
+            *(["--walls", physics.walls] if physics.walls != "noslip" else []),
+            *(["--precision", physics.precision] if physics.precision != "double" else [])]
 
 
 def solver_command(case: Case, out_dir: Path, domain: DomainParams, physics: PhysicsParams,
@@ -221,7 +223,11 @@ def count_gpus() -> int:
 
 
 def _config(seed: int, backend: str, domain, physics, sampling, fields=None) -> dict:
-    cfg = {"seed": seed, "backend": backend, "domain": asdict(domain), "physics": asdict(physics),
+    ph = asdict(physics)
+    for k, default in (("walls", "noslip"), ("precision", "double")):
+        if ph[k] == default:  # keep configs of earlier datasets unchanged
+            del ph[k]
+    cfg = {"seed": seed, "backend": backend, "domain": asdict(domain), "physics": ph,
            "sampling": {k: list(v) if isinstance(v, tuple) else v
                         for k, v in asdict(sampling).items()}}
     if fields is not None:  # absent for scalar-only datasets (v1 configs stay unchanged)
